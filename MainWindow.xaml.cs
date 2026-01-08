@@ -947,47 +947,77 @@ public partial class MainWindow
     {
         try
         {
-            if (!File.Exists(SettingsPath)) return;
-
-            var json = File.ReadAllText(SettingsPath);
-            var s = JsonSerializer.Deserialize<Settings>(json);
-            if (s == null) return;
-
-            // Restore selected preset
-            if (!string.IsNullOrWhiteSpace(s.SelectedPresetName))
+            // Case A: Settings file exists (Restore user preferences)
+            if (File.Exists(SettingsPath))
             {
-                var match = _presets.FirstOrDefault(p =>
-                    string.Equals(p.Name, s.SelectedPresetName, StringComparison.OrdinalIgnoreCase));
-                if (match != null)
-                    PresetCombo.SelectedItem = match;
+                var json = File.ReadAllText(SettingsPath);
+                var s = JsonSerializer.Deserialize<Settings>(json);
+
+                if (s != null)
+                {
+                    // Restore selected preset
+                    if (!string.IsNullOrWhiteSpace(s.SelectedPresetName))
+                    {
+                        var match = _presets.FirstOrDefault(p =>
+                            string.Equals(p.Name, s.SelectedPresetName, StringComparison.OrdinalIgnoreCase));
+                        if (match != null)
+                            PresetCombo.SelectedItem = match;
+                    }
+
+                    // Restore Checkboxes
+                    ShowWindowCheck.IsChecked = s.ShowWindow;
+                    OverwriteCheck.IsChecked = s.Overwrite;
+                    OutputFolderCheck.IsChecked = s.OutputFolderEnabled;
+
+                    // Restore Output Folder path
+                    OutputFolderBox.Text = s.OutputFolder ?? "";
+
+                    // Trigger logic to enable/disable the output box based on the checkbox
+                    OutputFolderCheck_Changed(this, new RoutedEventArgs());
+
+                    // Restore Jobs (clamped to valid UI range)
+                    int jobs = Math.Clamp(s.Jobs, 1, 4);
+                    JobsCombo.SelectedItem = jobs;
+
+                    // Restore Theme from Settings
+                    _isDarkTheme = s.DarkMode;
+                }
+            }
+            // Case B: No settings file (First Run)
+            else
+            {
+                // Detect Windows Theme automatically
+                _isDarkTheme = IsWindowsInDarkMode();
             }
 
-            // Restore Checkboxes
-            ShowWindowCheck.IsChecked = s.ShowWindow;
-            OverwriteCheck.IsChecked = s.Overwrite;
-            OutputFolderCheck.IsChecked = s.OutputFolderEnabled;
-
-            // Restore Output Folder path
-            OutputFolderBox.Text = s.OutputFolder ?? "";
-
-            // Trigger logic to enable/disable the output box based on the checkbox
-            OutputFolderCheck_Changed(this, new RoutedEventArgs());
-
-            // Restore Jobs (clamped to valid UI range)
-            int jobs = Math.Clamp(s.Jobs, 1, 4);
-            JobsCombo.SelectedItem = jobs;
-
-            // Restore Theme
-            _isDarkTheme = s.DarkMode;
+            // Apply the theme (Happens for both Case A and Case B)
             SetTheme(_isDarkTheme);
-            // Note: SetTheme updates the colors immediately here.
-            // The Window Title Bar color (black) is handled by the 
-            // SourceInitialized event in the Constructor.
         }
         catch
         {
             // ignore corrupt settings
         }
+    }
+
+    private bool IsWindowsInDarkMode()
+    {
+        try
+        {
+            // Registry key for Personalization
+            const string key = @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+            // Value: AppsUseLightTheme (0 = Dark, 1 = Light)
+            // We default to 1 (Light) if the key is missing
+            var val = Registry.GetValue(key, "AppsUseLightTheme", 1);
+
+            if (val is int i && i == 0)
+                return true; // 0 means Dark Mode
+        }
+        catch
+        {
+            // If registry read fails, assume Light
+        }
+        return false;
     }
 
     private void SaveSettings()
