@@ -600,9 +600,7 @@ public partial class MainWindow
 
         _initializing = false;
 
-        // Save settings opportunistically
-        // Save settings opportunistically
-        Closing += (_, _) => SaveSettings();
+        Closing += MainWindow_Closing;
 
         ShowWindowCheck.Checked += (_, _) => SaveSettings();
         ShowWindowCheck.Unchecked += (_, _) => SaveSettings();
@@ -632,6 +630,53 @@ public partial class MainWindow
         OutputFolderBox.TextChanged += (_, _) => { if (!_isRunning) SaveSettings(); };
         JobsCombo.SelectionChanged += JobsCombo_SelectionChanged;
 
+    }
+
+    private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        // 1. Always save settings first
+        SaveSettings();
+
+        // 2. Stop the main loop logic
+        _cts?.Cancel();
+        _jobAdjustCts?.Cancel();
+
+        // 3. Identify running processes safely
+        List<Process> procsToKill;
+        lock (_procLock)
+        {
+            procsToKill = _runningProcs.ToList();
+            _runningProcs.Clear(); // clear immediately to prevent double-handling
+        }
+
+        // 4. Force kill them
+        if (procsToKill.Count > 0)
+        {
+            foreach (var p in procsToKill)
+            {
+                try
+                {
+                    if (!p.HasExited)
+                    {
+                        // Kill the process AND any sub-shells it might have spawned
+#if NET8_0_OR_GREATER
+                        p.Kill(entireProcessTree: true);
+#else
+                    p.Kill();
+#endif
+                    }
+                }
+                catch
+                {
+                    // Process might have exited between the check and the kill.
+                    // We ignore errors here because we are shutting down anyway.
+                }
+                finally
+                {
+                    p.Dispose();
+                }
+            }
+        }
     }
 
     private void SuppressFollow(TimeSpan forHowLong)
