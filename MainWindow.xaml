@@ -1,0 +1,816 @@
+﻿<Window x:Class="FfmpegDrop.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="FFmpeg Drop v1.01" Width="1020" Height="760"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource Window.Background}"
+        Foreground="{DynamicResource Text.Primary}">
+
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis" />
+
+        <Style x:Key="SubtleText" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{DynamicResource Text.Subtle}"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+
+        <Style x:Key="CompactCellStyle" TargetType="DataGridCell">
+            <Setter Property="Padding" Value="6,2"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+
+        <Style x:Key="QueueRowStyle" TargetType="DataGridRow">
+            <Setter Property="Background" Value="{DynamicResource List.Background}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <!-- Default Text Color -->
+            <Setter Property="Foreground" Value="{DynamicResource Text.Primary}"/>
+
+            <Style.Triggers>
+                <!-- Status backgrounds -->
+                <DataTrigger Binding="{Binding Status}" Value="Pending">
+                    <Setter Property="Background" Value="{DynamicResource Row.Pending}"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Status}" Value="Running">
+                    <Setter Property="Background" Value="{DynamicResource Row.Running}"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Status}" Value="Ok">
+                    <Setter Property="Background" Value="{DynamicResource Row.Ok}"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Status}" Value="Failed">
+                    <Setter Property="Background" Value="{DynamicResource Row.Failed}"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Status}" Value="Skipped">
+                    <Setter Property="Background" Value="{DynamicResource Row.Skipped}"/>
+                </DataTrigger>
+
+                <!-- SELECTION HIGHLIGHT: Only applied when the list HAS FOCUS -->
+                <!-- We changed this from a simple Trigger to a MultiTrigger -->
+                <MultiTrigger>
+                    <MultiTrigger.Conditions>
+                        <Condition Property="IsSelected" Value="True"/>
+                        <Condition Property="Selector.IsSelectionActive" Value="True"/>
+                    </MultiTrigger.Conditions>
+                    <Setter Property="Background" Value="{DynamicResource Selection.Active}"/>
+                    <Setter Property="Foreground" Value="{DynamicResource Selection.Text}"/>
+                </MultiTrigger>
+
+                <!-- "Inactive" trigger has been deleted. 
+                     When focus is lost, it falls back to the Status triggers above. -->
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="ExpanderHeaderFocusVisual">
+            <Setter Property="Control.Template">
+                <Setter.Value>
+                    <ControlTemplate>
+                        <Border>
+                            <Rectangle Margin="0" StrokeDashArray="1 2" Stroke="{DynamicResource Text.Primary}" SnapsToDevicePixels="true" StrokeThickness="1"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- THIS IS THE MODIFIED STYLE FOR "DOWN" DIRECTION -->
+        <Style x:Key="ExpanderDownHeaderStyle" TargetType="{x:Type ToggleButton}">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="{x:Type ToggleButton}">
+                        <Border Padding="{TemplateBinding Padding}">
+                            <Grid Background="Transparent" SnapsToDevicePixels="False">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="19"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+
+                                <!-- CHANGED TO DYNAMIC RESOURCE -->
+                                <Ellipse x:Name="circle" 
+                                         Fill="{DynamicResource Expander.Static.Circle.Fill}" 
+                                         HorizontalAlignment="Center" Height="19" 
+                                         Stroke="{DynamicResource Expander.Static.Circle.Stroke}" 
+                                         VerticalAlignment="Center" Width="19"/>
+
+                                <!-- CHANGED TO DYNAMIC RESOURCE -->
+                                <Path x:Name="arrow" 
+                                      Data="M 1,4.5 L 4.5,1 L 8,4.5" 
+                                      HorizontalAlignment="Center" 
+                                      Stroke="{DynamicResource Expander.Static.Arrow.Stroke}" 
+                                      SnapsToDevicePixels="false" 
+                                      StrokeThickness="2" 
+                                      VerticalAlignment="Center"/>
+
+                                <ContentPresenter Grid.Column="1" 
+                                                  HorizontalAlignment="Stretch" 
+                                                  Margin="4,0,0,0" 
+                                                  RecognizesAccessKey="True" 
+                                                  SnapsToDevicePixels="True" 
+                                                  VerticalAlignment="Center"/>
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="true">
+                                <Setter Property="Data" TargetName="arrow" Value="M 1,1.5 L 4.5,5 L 8,1.5"/>
+                            </Trigger>
+
+                            <!-- ALL CHANGED TO DYNAMIC RESOURCE -->
+                            <Trigger Property="IsMouseOver" Value="true">
+                                <Setter Property="Stroke" TargetName="circle" Value="{DynamicResource Expander.MouseOver.Circle.Stroke}"/>
+                                <Setter Property="Fill" TargetName="circle" Value="{DynamicResource Expander.MouseOver.Circle.Fill}"/>
+                                <Setter Property="Stroke" TargetName="arrow" Value="{DynamicResource Expander.MouseOver.Arrow.Stroke}"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="true">
+                                <Setter Property="Stroke" TargetName="circle" Value="{DynamicResource Expander.Pressed.Circle.Stroke}"/>
+                                <Setter Property="StrokeThickness" TargetName="circle" Value="1.5"/>
+                                <Setter Property="Fill" TargetName="circle" Value="{DynamicResource Expander.Pressed.Circle.Fill}"/>
+                                <Setter Property="Stroke" TargetName="arrow" Value="{DynamicResource Expander.Pressed.Arrow.Stroke}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="false">
+                                <Setter Property="Stroke" TargetName="circle" Value="{DynamicResource Expander.Disabled.Circle.Stroke}"/>
+                                <Setter Property="Fill" TargetName="circle" Value="{DynamicResource Expander.Disabled.Circle.Fill}"/>
+                                <Setter Property="Stroke" TargetName="arrow" Value="{DynamicResource Expander.Disabled.Arrow.Stroke}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="BottomDrawerExpander" TargetType="{x:Type Expander}">
+            <Setter Property="Foreground" Value="{DynamicResource Text.Primary}"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Setter Property="VerticalContentAlignment" Value="Stretch"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="{x:Type Expander}">
+                        <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="3" SnapsToDevicePixels="true">
+                            <DockPanel>
+                                <ToggleButton x:Name="HeaderSite" ContentTemplate="{TemplateBinding HeaderTemplate}" Content="{TemplateBinding Header}" ContentTemplateSelector="{TemplateBinding HeaderTemplateSelector}" DockPanel.Dock="Top" FontStretch="{TemplateBinding FontStretch}" Foreground="{TemplateBinding Foreground}" FocusVisualStyle="{StaticResource ExpanderHeaderFocusVisual}" FontStyle="{TemplateBinding FontStyle}" FontFamily="{TemplateBinding FontFamily}" FontWeight="{TemplateBinding FontWeight}" FontSize="{TemplateBinding FontSize}" HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}" IsChecked="{Binding IsExpanded, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}" Margin="1" MinWidth="0" MinHeight="0" Padding="{TemplateBinding Padding}" Style="{StaticResource ExpanderDownHeaderStyle}" VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                                <ContentPresenter x:Name="ExpandSite" DockPanel.Dock="Bottom" Focusable="false" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" Margin="{TemplateBinding Padding}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" Visibility="Collapsed"/>
+                            </DockPanel>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsExpanded" Value="true">
+                                <Setter Property="Visibility" TargetName="ExpandSite" Value="Visible"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="false">
+                                <Setter Property="Foreground" Value="{DynamicResource Text.Subtle}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <ControlTemplate x:Key="ResizeGripTemplate" TargetType="{x:Type Thumb}">
+            <Grid Background="Transparent">
+                <Border x:Name="Pill"
+                        Width="40" Height="3" 
+                        VerticalAlignment="Center" 
+                        HorizontalAlignment="Center" 
+                        Background="{DynamicResource Pill.Normal}" 
+                        CornerRadius="1.5" 
+                        SnapsToDevicePixels="True"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="Pill" Property="Background" Value="{DynamicResource Pill.Hover}"/>
+                    <Setter Property="Cursor" Value="SizeNS"/>
+                </Trigger>
+                <Trigger Property="IsDragging" Value="True">
+                    <Setter TargetName="Pill" Property="Background" Value="{DynamicResource Pill.Drag}"/>
+                </Trigger>
+            </ControlTemplate.Triggers>
+        </ControlTemplate>
+
+        <!-- ========================================================= -->
+        <!-- GLOBAL CONTROL STYLES (Fixed & Updated)                   -->
+        <!-- ========================================================= -->
+
+        <!-- 1. FLATTENED BUTTON STYLE -->
+        <Style TargetType="Button">
+            <Setter Property="Background" Value="{DynamicResource Input.Background}"/>
+            <Setter Property="Foreground" Value="{DynamicResource Text.Primary}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource Control.Border}"/>
+            <Setter Property="BorderThickness" Value="2"/>
+            <Setter Property="MinHeight" Value="26"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="border" 
+                                Background="{TemplateBinding Background}" 
+                                BorderBrush="{TemplateBinding BorderBrush}" 
+                                BorderThickness="{TemplateBinding BorderThickness}" 
+                                CornerRadius="2">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="border" Property="Background" Value="{DynamicResource Control.StrongBorder}"/>
+                                <Setter Property="Foreground" Value="White"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="border" Property="Background" Value="{DynamicResource Selection.Active}"/>
+                                <Setter TargetName="border" Property="BorderBrush" Value="{DynamicResource Selection.Active}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="border" Property="Opacity" Value="0.4"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ========================================================= -->
+        <!-- COMBOBOX FIX (Custom Template to force Dark Mode)         -->
+        <!-- ========================================================= -->
+
+        <!-- 1. Helper Template for the Arrow Button -->
+        <ControlTemplate x:Key="ComboBoxToggleButtonTemplate" TargetType="ToggleButton">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition />
+                    <ColumnDefinition Width="20" />
+                </Grid.ColumnDefinitions>
+                <Border x:Name="Border" 
+                        Grid.ColumnSpan="2"
+                        CornerRadius="2"
+                        Background="{TemplateBinding Background}"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}" />
+                <Path x:Name="Arrow" 
+                      Grid.Column="1" 
+                      Fill="{TemplateBinding Foreground}"
+                      HorizontalAlignment="Center" 
+                      VerticalAlignment="Center"
+                      Data="M 0 0 L 4 4 L 8 0 Z"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="true">
+                    <Setter TargetName="Border" Property="Background" Value="{DynamicResource Control.StrongBorder}" />
+                </Trigger>
+                <Trigger Property="IsChecked" Value="true">
+                    <Setter TargetName="Border" Property="Background" Value="{DynamicResource Control.StrongBorder}" />
+                </Trigger>
+            </ControlTemplate.Triggers>
+        </ControlTemplate>
+
+        <!-- 2. Main ComboBox Style -->
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="{DynamicResource Input.Background}"/>
+            <Setter Property="Foreground" Value="{DynamicResource Text.Primary}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource Control.Border}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="6,4"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid x:Name="templateRoot" SnapsToDevicePixels="true">
+                            <Popup x:Name="PART_Popup" AllowsTransparency="true" Grid.ColumnSpan="2" IsOpen="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}" Margin="1" PopupAnimation="{DynamicResource {x:Static SystemParameters.ComboBoxPopupAnimationKey}}" Placement="Bottom">
+                                <Border x:Name="dropDownBorder" Background="{DynamicResource Input.Background}" BorderBrush="{DynamicResource Control.Border}" BorderThickness="1" MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                                    <ScrollViewer x:Name="DropDownScrollViewer">
+                                        <Grid x:Name="grid" RenderOptions.ClearTypeHint="Enabled">
+                                            <Canvas x:Name="canvas" HorizontalAlignment="Left" Height="0" VerticalAlignment="Top" Width="0">
+                                                <Rectangle x:Name="opaqueRect" Fill="{Binding Background, ElementName=dropDownBorder}" Height="{Binding ActualHeight, ElementName=dropDownBorder}" Width="{Binding ActualWidth, ElementName=dropDownBorder}"/>
+                                            </Canvas>
+                                            <ItemsPresenter x:Name="ItemsPresenter" KeyboardNavigation.DirectionalNavigation="Contained" SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}"/>
+                                        </Grid>
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+
+                            <!-- The Toggle Button (uses helper template above) -->
+                            <ToggleButton x:Name="toggleButton" 
+                                          BorderBrush="{TemplateBinding BorderBrush}" 
+                                          BorderThickness="{TemplateBinding BorderThickness}" 
+                                          Background="{TemplateBinding Background}" 
+                                          Foreground="{TemplateBinding Foreground}" 
+                                          Grid.ColumnSpan="2" 
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}" 
+                                          Template="{StaticResource ComboBoxToggleButtonTemplate}"/>
+
+                            <!-- The Content Selection -->
+                            <ContentPresenter x:Name="contentPresenter" 
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}" 
+                                              ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}" 
+                                              Content="{TemplateBinding SelectionBoxItem}" 
+                                              ContentStringFormat="{TemplateBinding SelectionBoxItemStringFormat}" 
+                                              HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" 
+                                              IsHitTestVisible="false" 
+                                              Margin="{TemplateBinding Padding}" 
+                                              SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}" 
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsEnabled" Value="false">
+                                <Setter Property="Opacity" TargetName="templateRoot" Value="0.5"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- 3. ComboBox Item Style (The list inside the dropdown) -->
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Background" Value="{DynamicResource Input.Background}"/>
+            <Setter Property="Foreground" Value="{DynamicResource Text.Primary}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="6,2"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="{DynamicResource Selection.Inactive}"/>
+                </Trigger>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="{DynamicResource Selection.Active}"/>
+                    <Setter Property="Foreground" Value="White"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <!-- 3. DARK DATAGRID HEADERS -->
+        <Style TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="{DynamicResource Input.Background}"/>
+            <Setter Property="Foreground" Value="{DynamicResource Text.Primary}"/>
+            <Setter Property="Padding" Value="8,4"/>
+            <Setter Property="BorderThickness" Value="0,0,1,1"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource Control.Border}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="DataGridColumnHeader">
+                        <Border Background="{TemplateBinding Background}" 
+                                BorderBrush="{TemplateBinding BorderBrush}" 
+                                BorderThickness="{TemplateBinding BorderThickness}">
+                            <ContentPresenter HorizontalAlignment="Left" VerticalAlignment="Center" Margin="{TemplateBinding Padding}"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- 4. CLEAN PROGRESS BAR -->
+        <Style TargetType="ProgressBar">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Foreground" Value="{DynamicResource Selection.Active}"/>
+        </Style>
+
+        <!-- 5. CHECKBOX TEXT COLOR -->
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="{DynamicResource Text.Primary}"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+
+    </Window.Resources>
+    <Grid Margin="8">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <!-- status -->
+            <RowDefinition Height="Auto"/>
+            <!-- preset + controls -->
+            <RowDefinition Height="Auto"/>
+            <!-- args expander -->
+            <RowDefinition Height="Auto"/>
+            <!-- run strip -->
+            <RowDefinition Height="*"/>
+            <!-- main -->
+        </Grid.RowDefinitions>
+
+
+        <!-- Top status line -->
+        <DockPanel Grid.Row="0" LastChildFill="True">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="FFmpeg:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <TextBlock x:Name="FfmpegStatusText" VerticalAlignment="Center" Foreground="{DynamicResource Text.Subtle}"/>
+            </StackPanel>
+
+            <!-- Buttons on the Right (Wrapped in StackPanel) -->
+            <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" HorizontalAlignment="Right">
+                <!-- New About Button -->
+                <Button Content="About" Width="60" Margin="0,0,8,0" Click="About_Click"/>
+
+                <!-- Existing Theme Button -->
+                <Button Content="Dark/Light" Width="80" Click="ToggleTheme_Click"/>
+            </StackPanel>
+        </DockPanel>
+
+
+
+
+        <!-- Preset + control row(s) -->
+        <Grid Grid.Row="1" Margin="0,10,0,8">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- 1. TOGGLE ROW (Moved to Top: Row 0) -->
+            <Grid Grid.Row="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <CheckBox x:Name="ShowWindowCheck"
+                  Grid.Column="0"
+                  Content="Show FFmpeg window"
+                  VerticalAlignment="Center"/>
+
+                <CheckBox x:Name="OverwriteCheck"
+                  Grid.Column="1"
+                  Content="Overwrite originals"
+                  Margin="16,0,0,0"
+                  VerticalAlignment="Center"
+                  ToolTip="If unchecked and output folder is the same as input, output becomes name + '_out' + ext."/>
+
+                <TextBlock Grid.Column="2" Text="Jobs:" Margin="16,0,6,0" VerticalAlignment="Center"/>
+
+                <ComboBox x:Name="JobsCombo" Grid.Column="3" Width="70" VerticalAlignment="Center" Background="{DynamicResource Input.Background}"/>
+
+                <TextBlock x:Name="JobsLiveHint" Grid.Column="4" Margin="8,0,0,0" VerticalAlignment="Center" Foreground="{DynamicResource Text.Subtle}" FontSize="12" Text=""/>
+
+                <CheckBox x:Name="OutputFolderCheck"
+                  Grid.Column="5"
+                  Content="Output folder:"
+                  Margin="16,0,0,0"
+                  VerticalAlignment="Center"
+                  Checked="OutputFolderCheck_Changed"
+                  Unchecked="OutputFolderCheck_Changed"
+                  ToolTip="If unchecked and output folder is the same as input, output becomes name + '_out' + ext."/>
+
+                <TextBox x:Name="OutputFolderBox" Grid.Column="6" Margin="8,0,0,0" IsEnabled="False" Background="{DynamicResource Input.Background}" Foreground="{DynamicResource Text.Primary}" CaretBrush="{DynamicResource Text.Primary}"/>
+
+                <Button x:Name="BrowseOutBtn" Grid.Column="7" Content="Browse…" Width="90" Margin="8,0,0,0" IsEnabled="False" Click="BrowseOutput_Click"/>
+            </Grid>
+
+
+            <!-- 2. PRESET ROW (Row 1) -->
+            <Grid Grid.Row="1" Margin="0,10,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <!-- Label -->
+                    <ColumnDefinition Width="*"/>
+                    <!-- Combo -->
+                    <ColumnDefinition Width="Auto"/>
+                    <!-- New -->
+                    <ColumnDefinition Width="Auto"/>
+                    <!-- Save -->
+                    <ColumnDefinition Width="Auto"/>
+                    <!-- Rename -->
+                    <ColumnDefinition Width="Auto"/>
+                    <!-- Delete -->
+                </Grid.ColumnDefinitions>
+
+                <TextBlock Grid.Column="0" Text="Preset:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+
+                <ComboBox x:Name="PresetCombo"
+                  Grid.Column="1"
+                  MinWidth="300"
+                  SelectionChanged="PresetCombo_SelectionChanged"
+                  Background="{DynamicResource Input.Background}"/>
+
+                <!-- Button Group -->
+                <Button Grid.Column="2" Content="New…" Width="60" Margin="8,0,0,0" Click="NewPreset_Click"/>
+                <Button Grid.Column="3" Content="Save" Width="60" Margin="6,0,0,0" Click="SaveCurrentPreset_Click"/>
+                <Button Grid.Column="4" Content="Rename…" Width="70" Margin="6,0,0,0" Click="RenamePreset_Click"/>
+                <Button Grid.Column="5" Content="Delete" Width="60" Margin="6,0,0,0" Click="DeletePreset_Click"/>
+            </Grid>
+        </Grid>
+
+        <!-- Args expander -->
+        <Expander x:Name="ArgsExpander"
+                  Grid.Row="2" 
+                  IsExpanded="False" 
+                  Margin="0,0,0,0"
+                  Expanded="ArgsExpander_Expanded">
+            <Expander.Header>
+                <DockPanel LastChildFill="True">
+                    <TextBlock Text="FFmpeg Arguments (must include {in} and {out})"
+                       FontWeight="SemiBold"
+                       VerticalAlignment="Center"
+                       Foreground="{DynamicResource Text.Primary}"/>
+                    <TextBlock DockPanel.Dock="Right"
+                       Text="Tokens: {in} {out} {dir} {name} {ext}"
+                       Foreground="{DynamicResource Text.Subtle}"
+                       Margin="12,0,0,0"
+                       VerticalAlignment="Center"/>
+                </DockPanel>
+            </Expander.Header>
+
+            <!-- NEW STRUCTURE: A Grid contains the Border (top) and the Thumb (bottom) -->
+            <Grid Margin="0,6,0,0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <!-- The Border/TextBox -->
+                    <RowDefinition Height="Auto"/>
+                    <!-- The Thumb -->
+                </Grid.RowDefinitions>
+
+                <!-- Row 0: The Border ONLY wraps the TextBox now -->
+                <Border Grid.Row="0" BorderBrush="{DynamicResource Control.Border}" BorderThickness="1" Padding="8">
+                    <TextBox x:Name="ArgsBox"
+                     AcceptsReturn="True"
+                     TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto"
+                     FontFamily="Consolas"
+                     FontSize="13"
+                     MinHeight="60"
+                     Height="120"
+                     BorderThickness="0"
+                     Background="{DynamicResource Input.Background}" 
+                     Foreground="{DynamicResource Text.Primary}" 
+                     CaretBrush="{DynamicResource Text.Primary}"/>
+                </Border>
+
+                <!-- Row 1: The Thumb sits outside, cleaner look -->
+                <Thumb Grid.Row="1" 
+               Height="24" 
+               Cursor="SizeNS"
+               Template="{StaticResource ResizeGripTemplate}" 
+               DragDelta="ArgsGripper_DragDelta"/>
+            </Grid>
+        </Expander>
+
+        <!-- Run strip (Row 3) -->
+        <!-- Run strip (Row 3) -->
+        <Grid Grid.Row="3" Margin="0,10,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <!-- 0: Run -->
+                <ColumnDefinition Width="Auto"/>
+                <!-- 1: Pause -->
+                <ColumnDefinition Width="Auto"/>
+                <!-- 2: Cancel -->
+                <ColumnDefinition Width="Auto"/>
+                <!-- 3: Add Files -->
+                <ColumnDefinition Width="Auto"/>
+                <!-- 4: Remove -->
+                <ColumnDefinition Width="Auto"/>
+                <!-- 5: Clear -->
+
+                <ColumnDefinition Width="18"/>
+                <!-- 6: small gap -->
+                <ColumnDefinition Width="*"/>
+                <!-- 7: Progress -->
+            </Grid.ColumnDefinitions>
+
+            <Button Grid.Column="0" x:Name="RunBtn" Content="Run" Width="90" Click="Run_Click"/>
+            <Button Grid.Column="1" x:Name="PauseBtn" Content="Pause" Width="90" Margin="8,0,0,0"
+            IsEnabled="False" Click="Pause_Click"/>
+            <Button Grid.Column="2" x:Name="CancelBtn" Content="Cancel" Width="90" Margin="8,0,0,0"
+            IsEnabled="False" Click="Cancel_Click"/>
+
+            <Button Grid.Column="3" Content="Add Files…" Width="110" Margin="24,0,0,0"
+            Click="AddFiles_Click"/>
+            <Button Grid.Column="4" Content="Remove Selected" Width="129" Margin="8,0,0,0"
+            Click="RemoveSelected_Click"/>
+            <Button Grid.Column="5" Content="Clear" Width="90" Margin="8,0,0,0"
+            Click="Clear_Click"/>
+
+            <!-- Fixed-width progress with a visible track border -->
+            <Border Grid.Column="8"
+            BorderBrush="{DynamicResource {x:Static SystemColors.ActiveBorderBrushKey}}"
+            BorderThickness="1"
+            CornerRadius="3"
+            Padding="1"
+            VerticalAlignment="Center">
+                <ProgressBar x:Name="Progress"
+                     Height="18"
+                     VerticalAlignment="Center"/>
+            </Border>
+        </Grid>
+
+        <!-- Main split -->
+        <Grid Grid.Row="4">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>
+                <!-- LogRowDef: Auto when closed, Pixel Size when open -->
+                <RowDefinition Height="Auto" x:Name="LogRowDef"/>
+            </Grid.RowDefinitions>
+
+            <!-- Queue Area (Replaces GroupBox with Cleaner Layout) -->
+            <Grid Grid.Row="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <!-- Header Text -->
+                    <RowDefinition Height="*"/>
+                    <!-- The List -->
+                </Grid.RowDefinitions>
+
+                <!-- 1. The Header Text -->
+                <!-- 1. The Header (Queue label + Status text) -->
+                <Grid Grid.Row="0" Margin="0,0,0,6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+
+                    <TextBlock Grid.Column="0"
+               Text="Queue (drop files/folders here)"
+               FontWeight="SemiBold"
+               VerticalAlignment="Center"/>
+
+                    <!-- Status moved here -->
+                    <TextBlock Grid.Column="1"
+               x:Name="StatusText"
+               Style="{StaticResource SubtleText}"
+               Margin="12,0,0,0"
+               VerticalAlignment="Center"
+               TextAlignment="Right"
+               MaxWidth="700"
+               TextTrimming="CharacterEllipsis"
+               ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+                </Grid>
+
+
+                <!-- 2. The DataGrid (Wrapped in a standard border) -->
+                <Border Grid.Row="1" 
+                BorderBrush="{DynamicResource Control.StrongBorder}" 
+                BorderThickness="1">
+
+                    <DataGrid x:Name="FilesList"
+                      Margin="0"
+                      SelectionMode="Extended"
+                      SelectionChanged="FilesList_SelectionChanged"
+                      AutoGenerateColumns="False"
+                      HeadersVisibility="Column"
+                      GridLinesVisibility="None"
+                      RowStyle="{StaticResource QueueRowStyle}"
+                      CellStyle="{StaticResource CompactCellStyle}"
+                      CanUserAddRows="False"
+                      CanUserDeleteRows="False"
+                      CanUserResizeRows="False"
+                      IsReadOnly="True"
+                      AllowDrop="True"
+                      PreviewDragOver="FilesList_PreviewDragOver"
+                      Drop="FilesList_Drop"
+                      VirtualizingPanel.IsVirtualizing="True"
+                      VirtualizingPanel.VirtualizationMode="Recycling"
+                      ScrollViewer.CanContentScroll="True"
+                      BorderThickness="0"
+                      Background="{DynamicResource List.Background}">
+                        <!-- Turn off DataGrid's internal border -->
+
+
+                        <DataGrid.Columns>
+                            <!-- File Column -->
+                            <DataGridTemplateColumn Header="File" Width="Auto" MinWidth="400">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <Grid ToolTip="{Binding Path}" Margin="6,2">
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto"/>
+                                                <RowDefinition Height="Auto"/>
+                                            </Grid.RowDefinitions>
+                                            <TextBlock Grid.Row="0" Text="{Binding FileName}" FontWeight="SemiBold" TextTrimming="None" TextWrapping="NoWrap"/>
+                                            <TextBlock Grid.Row="1" x:Name="DirText" Text="{Binding DirectoryName}" Foreground="{DynamicResource Directory.Normal}" FontSize="11" TextTrimming="None" TextWrapping="NoWrap"/>
+                                        </Grid>
+                                        <DataTemplate.Triggers>
+                                            <MultiDataTrigger>
+                                                <MultiDataTrigger.Conditions>
+                                                    <Condition Binding="{Binding RelativeSource={RelativeSource Mode=FindAncestor, AncestorType={x:Type DataGridRow}}, Path=IsSelected}" Value="True"/>
+                                                    <Condition Binding="{Binding RelativeSource={RelativeSource Mode=FindAncestor, AncestorType={x:Type DataGrid}}, Path=IsKeyboardFocusWithin}" Value="True"/>
+                                                </MultiDataTrigger.Conditions>
+                                                <Setter TargetName="DirText" Property="Foreground" Value="{DynamicResource Directory.Selected}"/>
+                                            </MultiDataTrigger>
+                                        </DataTemplate.Triggers>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+
+                            <!-- Progress Column (Unchanged) -->
+                            <!-- Progress Column (with visible track border) -->
+                            <DataGridTemplateColumn Header="Progress" Width="*" MinWidth="140">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <Border BorderBrush="{DynamicResource Control.Border}"
+        BorderThickness="1"
+        Opacity="0.55"
+        CornerRadius="3"
+        Padding="1"
+        Margin="4,2"
+        VerticalAlignment="Center">
+                                            <ProgressBar Minimum="0"
+                 Maximum="100"
+                 Height="14"
+                 BorderThickness="0"
+                 Background="Transparent"
+                 Value="{Binding ProgressPercent, Mode=OneWay}"/>
+                                        </Border>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+
+                            <!-- % Column: Centered -->
+                            <DataGridTemplateColumn Header="%" Width="50">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding ProgressText, Mode=OneWay}" 
+                                               VerticalAlignment="Center" 
+                                               HorizontalAlignment="Center"/>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+
+                            <!-- ETA Column: Centered -->
+                            <DataGridTemplateColumn Header="ETA" Width="60">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding ETAString, Mode=OneWay}" 
+                                               VerticalAlignment="Center" 
+                                               HorizontalAlignment="Center"/>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+
+                            <!-- Speed Column: Centered -->
+                            <DataGridTemplateColumn Header="Speed" Width="50">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding SpeedText, Mode=OneWay}" 
+                                               VerticalAlignment="Center" 
+                                               HorizontalAlignment="Center"/>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                        </DataGrid.Columns>
+
+                    </DataGrid>
+                </Border>
+            </Grid>
+
+            <!-- LOG DRAWER (ROW 1) -->
+            <Expander x:Name="LogExpander"
+              Grid.Row="1"
+              ExpandDirection="Down"
+              Style="{StaticResource BottomDrawerExpander}"
+              IsExpanded="False"
+              Expanded="LogExpander_Expanded"
+              Collapsed="LogExpander_Collapsed"
+              Padding="0"
+              BorderThickness="0">
+
+                <Expander.Header>
+                    <!-- Changed to Grid to allow centering the Thumb -->
+                    <Grid Height="24">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="11*"/>
+                            <RowDefinition/>
+                        </Grid.RowDefinitions>
+                        <!-- Left Text -->
+                        <TextBlock Text="Log" 
+                           FontWeight="SemiBold" 
+                           VerticalAlignment="Center" 
+                           HorizontalAlignment="Left"/>
+
+                        <!-- Center Thumb (The Grab Bar) -->
+                        <Thumb Template="{StaticResource ResizeGripTemplate}" 
+                       Height="12"
+                       Cursor="SizeNS"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"
+                       DragDelta="LogGripper_DragDelta"
+                       Visibility="{Binding IsExpanded, RelativeSource={RelativeSource Mode=FindAncestor, AncestorType=Expander}, Converter={StaticResource BoolToVis}}"/>
+
+                        <!-- Right Text -->
+                        <TextBlock Text="(live only when FFmpeg window is hidden)"
+                           Foreground="{DynamicResource Text.Subtle}"
+                           VerticalAlignment="Center"
+                           HorizontalAlignment="Left"
+                           Margin="30,0,0,0"/>
+
+                    </Grid>
+                </Expander.Header>
+
+                <Border BorderBrush="{DynamicResource Control.StrongBorder}" 
+                BorderThickness="1" 
+                Margin="4,0,4,4"
+                Background="Transparent">
+                    <TextBox x:Name="LogBox"
+                     Margin="0"
+                     Padding="4"
+                     IsReadOnly="True"
+                     TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto"
+                     FontFamily="Consolas"
+                     FontSize="12"
+                     BorderThickness="0"
+                     Background="{DynamicResource Input.Background}" 
+                     Foreground="{DynamicResource Text.Primary}" 
+                     CaretBrush="{DynamicResource Text.Primary}"/>
+                </Border>
+            </Expander>
+        </Grid>
+    </Grid>
+</Window>

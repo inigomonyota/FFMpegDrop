@@ -1,0 +1,31 @@
+## Visual Studio Build folders
+[Bb]in/
+[Oo]bj/
+
+## Visual Studio User-specific settings (The hidden .vs folder)
+.vs/
+
+## User-specific project settings
+*.csproj.user
+*.user
+*.suo
+
+## Build results
+*.dll
+*.exe
+*.pdb
+
+## FFmpeg Drop specific runtime files
+# You don't want to commit your personal settings or the large ffmpeg binaries
+settings.json
+ffmpeg.exe
+ffprobe.exe
+
+## Temporary files
+*.log
+*.tmp
+
+## OS specific
+Thumbs.db
+Desktop.ini
+.DS_Store
