@@ -6,7 +6,7 @@ FFmpeg Drop was built born out of frustration. Most "Video Converters" are just 
 
 This tool is different. It doesn't hide FFmpeg; it embraces it. It puts the power of the command line in a modern, drag-and-drop interface that actually respects your system resources.
 
-![Screenshot Placeholder](screenshot.png) *(You should add a screenshot here!)*
+<img width="1006" height="753" alt="app-preview" src="https://github.com/user-attachments/assets/34364288-79e6-456e-a36c-12254ebf4668" />
 
 ## Why is this different?
 
@@ -68,5 +68,6 @@ This is a WPF (.NET 8) application designed to solve the common threading pitfal
 This tool is free and open source. If you find it useful and want to support its development, you can do so here:
 
 [Donate via BuyMeACoffee]
+
 
 http://www.buymeacoffee.com/inigomonyota
