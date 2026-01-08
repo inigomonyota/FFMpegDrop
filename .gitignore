@@ -29,3 +29,4 @@ ffprobe.exe
 Thumbs.db
 Desktop.ini
 .DS_Store
+*.sln
