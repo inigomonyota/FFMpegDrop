@@ -1,23 +1,20 @@
-﻿using System;
+﻿using Microsoft.Win32;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
+using System.Media;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 using System.Threading.Channels;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Threading;
-using Microsoft.Win32;
-using WF = System.Windows.Forms;
-using System.Collections.ObjectModel;
-using System.ComponentModel;
 using System.Windows.Media;
+using System.Windows.Shell;
+using System.Windows.Threading;
+using WF = System.Windows.Forms;
 
 namespace FfmpegDrop;
 
@@ -53,6 +50,8 @@ public partial class MainWindow
 
     private readonly DispatcherTimer _enforceThrottleTimer;
     private volatile bool _enforcePending = false;
+
+    private bool _wasCancelled = false;
 
     private enum JobStatus
     {
@@ -999,7 +998,7 @@ public partial class MainWindow
         }
     }
 
-    private bool IsWindowsInDarkMode()
+    static private bool IsWindowsInDarkMode()
     {
         try
         {
@@ -1545,6 +1544,8 @@ public partial class MainWindow
     {
         if (!_isRunning) return;
 
+        _wasCancelled = true;
+
         Status("Cancelling…");
         _cts?.Cancel();
 
@@ -1624,6 +1625,30 @@ public partial class MainWindow
         }
     }
 
+    private void UpdateTaskbarProgress()
+    {
+        if (TaskbarInfo == null)
+            return;
+
+        // If not running or no jobs, clear taskbar progress.
+        if (!_isRunning || Progress.Maximum <= 0)
+        {
+            TaskbarInfo.ProgressState = TaskbarItemProgressState.None;
+            TaskbarInfo.ProgressValue = 0;
+            return;
+        }
+
+        double ratio = 0.0;
+        if (Progress.Maximum > 0)
+            ratio = Math.Clamp(Progress.Value / Progress.Maximum, 0.0, 1.0);
+
+        TaskbarInfo.ProgressState = _isPaused
+            ? TaskbarItemProgressState.Paused
+            : TaskbarItemProgressState.Normal;
+
+        TaskbarInfo.ProgressValue = ratio;
+    }
+
     private void SetOverallProgressCompleted(bool done)
     {
         if (!Dispatcher.CheckAccess())
@@ -1644,11 +1669,24 @@ public partial class MainWindow
         }
     }
 
+    private void SetOverallProgressCancelled()
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(SetOverallProgressCancelled, DispatcherPriority.Background);
+            return;
+        }
+
+        // Pick any red you like
+        Progress.Foreground = Brushes.IndianRed;
+    }
+
     // ---------------- Run (parallel jobs) ----------------
     private async void Run_Click(object sender, RoutedEventArgs e)
     {
         if (_isRunning) return;
 
+        _wasCancelled = false;
         UpdateFfmpegStatus();
         string? ffmpegExe = ResolveFfmpegExeOrNull();
         if (ffmpegExe == null)
@@ -1746,6 +1784,8 @@ public partial class MainWindow
         Progress.Value = 0;
 
         SetOverallProgressCompleted(false);
+
+        UpdateTaskbarProgress();
 
         LogBox.Clear();
         Log("=== Run ===");
@@ -2143,6 +2183,7 @@ public partial class MainWindow
                     {
                         Progress.Value = d;
                         Status($"Running… OK={okNow} FAIL={failNow} ({d}/{jobsList.Count})");
+                        UpdateTaskbarProgress();
                     }, DispatcherPriority.Background);
                 }
             }
@@ -2256,11 +2297,41 @@ public partial class MainWindow
 
                 RunBtn.IsEnabled = true;
                 UpdateFfmpegStatus();
-                Status($"Done. OK={okNow}, FAIL={failNow}");
-                SetOverallProgressCompleted(true);
+
+                if (_wasCancelled)
+                {
+                    // User explicitly cancelled: don't turn the bar green, just say "Cancelled".
+                    Status("Cancelled.");
+                    SetOverallProgressCancelled();
+                }
+                else
+                {
+                    // Completed run (even with some FAILs) → mark as done and turn bar green.
+                    Status($"Done. OK={okNow}, FAIL={failNow}");
+                    SetOverallProgressCompleted(true);
+
+                    // Play a Windows "ding" only on true completion, not on cancel.
+                    try
+                    {
+                        SystemSounds.Asterisk.Play();
+                    }
+                    catch
+                    {
+                        // ignore sound errors
+                    }
+                }
+
+                // Clear taskbar progress either way.
+                if (TaskbarInfo != null)
+                {
+                    TaskbarInfo.ProgressState = TaskbarItemProgressState.None;
+                    TaskbarInfo.ProgressValue = 0;
+                }
+
                 // Clear/refresh the hint now that _isRunning is false
                 UpdateJobsLiveHint();
             }, DispatcherPriority.Background);
+
             StopFollowingActiveJobs();
 
             Log($"=== Done. OK={okNow}, FAIL={failNow} ===");
@@ -2765,6 +2836,7 @@ public partial class MainWindow
             Status("Running…");
             Log("[SYSTEM] Batch resumed by user.");
         }
+        UpdateTaskbarProgress();
     }
 
     [System.Runtime.InteropServices.DllImport("kernel32.dll")]
