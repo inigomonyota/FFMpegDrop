@@ -2,7 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
-        Title="FFmpeg Drop v1.02" Width="1020" Height="760"
+        xmlns:local="clr-namespace:FfmpegDrop" 
+        Title="FFmpeg Drop v1.03" Width="1020" Height="760"
         WindowStartupLocation="CenterScreen"
         Background="{DynamicResource Window.Background}"
         Foreground="{DynamicResource Text.Primary}">
@@ -648,6 +649,8 @@
                       Margin="0"
                       SelectionMode="Extended"
                       SelectionChanged="FilesList_SelectionChanged"
+                      CanUserResizeColumns="True"
+                      CanUserReorderColumns="False"
                       AutoGenerateColumns="False"
                       HeadersVisibility="Column"
                       GridLinesVisibility="None"
@@ -670,33 +673,68 @@
 
                         <DataGrid.Columns>
                             <!-- File Column -->
-                            <DataGridTemplateColumn Header="File" Width="Auto" MinWidth="400">
+                            <DataGridTemplateColumn Header="File" Width="*" MinWidth="450">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
-                                        <Grid ToolTip="{Binding Path}" Margin="6,2">
+                                        <!-- Increased vertical margin (6,4) to give the 3 rows breathing room -->
+                                        <Grid ToolTip="{Binding Path}" Margin="6,4">
                                             <Grid.RowDefinitions>
                                                 <RowDefinition Height="Auto"/>
+                                                <!-- Filename -->
                                                 <RowDefinition Height="Auto"/>
+                                                <!-- Stats (NEW) -->
+                                                <RowDefinition Height="Auto"/>
+                                                <!-- Directory -->
                                             </Grid.RowDefinitions>
-                                            <TextBlock Grid.Row="0" Text="{Binding FileName}" FontWeight="SemiBold" TextTrimming="None" TextWrapping="NoWrap"/>
-                                            <TextBlock Grid.Row="1" x:Name="DirText" Text="{Binding DirectoryName}" Foreground="{DynamicResource Directory.Normal}" FontSize="11" TextTrimming="None" TextWrapping="NoWrap"/>
+
+                                            <!-- Row 0: Filename -->
+                                            <TextBlock Grid.Row="0" 
+                           Text="{Binding FileName}" 
+                           FontWeight="SemiBold" 
+                           FontSize="13"
+                           TextTrimming="CharacterEllipsis" 
+                           TextWrapping="NoWrap"/>
+
+                                            <!-- Row 1: Video Stats (The New Line) -->
+                                            <!-- We use a distinct grey (#A0A0A0) so it stands out as metadata -->
+                                            <TextBlock Grid.Row="1" 
+                           local:JobStatsFormatter.FileJob="{Binding}" 
+                           Foreground="#A0A0A0" 
+                           FontSize="11" 
+                           Margin="0,1,0,1"
+                           TextTrimming="CharacterEllipsis" 
+                           TextWrapping="NoWrap"/>
+
+                                            <!-- Row 2: Directory -->
+                                            <TextBlock Grid.Row="2" 
+                           x:Name="DirText" 
+                           Text="{Binding DirectoryName}" 
+                           Foreground="{DynamicResource Directory.Normal}" 
+                           FontSize="11" 
+                           TextTrimming="CharacterEllipsis" 
+                           TextWrapping="NoWrap"
+                           Opacity="0.75"/>
                                         </Grid>
+
                                         <DataTemplate.Triggers>
+                                            <!-- Keep your existing trigger to highlight Directory on selection -->
                                             <MultiDataTrigger>
                                                 <MultiDataTrigger.Conditions>
                                                     <Condition Binding="{Binding RelativeSource={RelativeSource Mode=FindAncestor, AncestorType={x:Type DataGridRow}}, Path=IsSelected}" Value="True"/>
                                                     <Condition Binding="{Binding RelativeSource={RelativeSource Mode=FindAncestor, AncestorType={x:Type DataGrid}}, Path=IsKeyboardFocusWithin}" Value="True"/>
                                                 </MultiDataTrigger.Conditions>
                                                 <Setter TargetName="DirText" Property="Foreground" Value="{DynamicResource Directory.Selected}"/>
+
+                                                <!-- Optional: If you want the Stats line to turn bright white on selection, uncomment this: -->
+                                                <!-- <Setter Property="Foreground" Value="White" /> -->
                                             </MultiDataTrigger>
                                         </DataTemplate.Triggers>
                                     </DataTemplate>
                                 </DataGridTemplateColumn.CellTemplate>
                             </DataGridTemplateColumn>
-
                             <!-- Progress Column (Unchanged) -->
                             <!-- Progress Column (with visible track border) -->
-                            <DataGridTemplateColumn Header="Progress" Width="*" MinWidth="140">
+                            <DataGridTemplateColumn Header="Progress" Width="120" MinWidth="120">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
                                         <Border BorderBrush="{DynamicResource Control.Border}"
@@ -718,7 +756,7 @@
                             </DataGridTemplateColumn>
 
                             <!-- % Column: Centered -->
-                            <DataGridTemplateColumn Header="%" Width="50">
+                            <DataGridTemplateColumn Header="%" Width="50" MinWidth="50">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
                                         <TextBlock Text="{Binding ProgressText, Mode=OneWay}" 
@@ -729,7 +767,7 @@
                             </DataGridTemplateColumn>
 
                             <!-- ETA Column: Centered -->
-                            <DataGridTemplateColumn Header="ETA" Width="60">
+                            <DataGridTemplateColumn Header="ETA" Width="60" MinWidth="60">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
                                         <TextBlock Text="{Binding ETAString, Mode=OneWay}" 

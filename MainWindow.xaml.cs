@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Media;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -22,8 +23,6 @@ public partial class MainWindow
 {
 
     private readonly SemaphoreSlim _probeSem = new(2, 2); // keep low (1–3 is plenty)
-    private readonly ConcurrentDictionary<string, double?> _durationCache =
-        new(StringComparer.OrdinalIgnoreCase);
     private readonly ObservableCollection<FileJob> _queue = new();
     private readonly HashSet<string> _queueSet = new(StringComparer.OrdinalIgnoreCase);
 
@@ -53,7 +52,7 @@ public partial class MainWindow
 
     private bool _wasCancelled = false;
 
-    private enum JobStatus
+    internal enum JobStatus
     {
         Pending,
         Running,
@@ -305,7 +304,7 @@ public partial class MainWindow
         LogRowDef.Height = new GridLength(newHeight);
     }
 
-    private sealed class FileJob : INotifyPropertyChanged
+    internal sealed class FileJob : INotifyPropertyChanged
     {
         public string Path { get; }
 
@@ -326,6 +325,7 @@ public partial class MainWindow
                 if (_status == value) return;
                 _status = value;
                 OnPropertyChanged(nameof(Status));
+                // Update stats string because "Ok" status triggers the Input -> Output comparison view
             }
         }
 
@@ -344,6 +344,34 @@ public partial class MainWindow
                 OnPropertyChanged(nameof(LastMessage));
             }
         }
+
+        // ---------------- Metadata / Stats (NEW) ----------------
+        public MediaProbeInfo? InputInfo { get; private set; }
+        public MediaProbeInfo? OutputInfo { get; private set; }
+
+        // Helper to keep the string short and clean
+        private static string FormatBitrate(long bps)
+        {
+            if (bps >= 1_000_000)
+                return $"{bps / 1_000_000.0:0.0} Mb/s";
+
+            return $"{bps / 1000.0:0} kb/s";
+        }
+        public void SetInputInfo(MediaProbeInfo info)
+        {
+            InputInfo = info;
+            // We notify "Self" so the attached property sees a change on the object
+            OnPropertyChanged(nameof(InputInfo));
+            NotifyPropertyChanged(string.Empty); // Force full refresh for UI binding
+        }
+
+        public void SetOutputInfo(MediaProbeInfo info)
+        {
+            OutputInfo = info;
+            OnPropertyChanged(nameof(OutputInfo));
+            NotifyPropertyChanged(string.Empty);
+        }
+
 
         // ---------------- Duration (ffprobe) ----------------
         // IMPORTANT: must be a notifying property (NOT auto-property),
@@ -1748,7 +1776,7 @@ public partial class MainWindow
             }
         }
 
-        // ✅ INSERT YOUR CHECK HERE (right after the existing folder creation)
+        // Output folder writeability check
         if (!overwriteInPlace && outFolderEnabled && !string.IsNullOrWhiteSpace(outFolder))
         {
             try
@@ -1766,7 +1794,32 @@ public partial class MainWindow
             }
         }
 
+        // Persist current settings (args, jobs, etc.)
         SaveSettings();
+
+        // 🔍 VALIDATE FFMPEG ARGS BEFORE STARTING BATCH
+        Status("Validating FFmpeg arguments...");
+        RunBtn.IsEnabled = false;
+        CancelBtn.IsEnabled = false;
+        PauseBtn.IsEnabled = false;
+
+        bool valid = await ValidateFfmpegArgsAsync(ffmpegExe, argsTemplate);
+        if (!valid)
+        {
+            Status("FFmpeg argument validation failed. See log for details.");
+            MessageBox.Show(
+                this,
+                "FFmpeg could not run with the current arguments.\n\n" +
+                "No files were processed.\n\n" +
+                "Check the log window for details, fix the FFmpeg template, then try again.",
+                "FFmpeg Argument Validation Failed",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+
+
+            RunBtn.IsEnabled = true;
+            return;
+        }
 
         // ---- UI: entering run ----
         _isRunning = true;
@@ -2091,6 +2144,9 @@ public partial class MainWindow
 
                     if (result.ExitCode == 0)
                     {
+                        // 1. Determine where the final file actually is
+                        string actualFinalPath = "";
+
                         if (overwriteInPlace)
                         {
                             try
@@ -2101,13 +2157,14 @@ public partial class MainWindow
                                 System.IO.File.Replace(tempOut, input, backup, ignoreMetadataErrors: true);
 
                                 if (System.IO.File.Exists(backup)) System.IO.File.Delete(backup);
+
+                                actualFinalPath = input; // The input path is now the new file
                             }
                             catch (Exception ex)
                             {
-                                Log($"[{fileLabel}] [FAIL] Replace failed: {ex.Message}", job); // Added job param
+                                Log($"[{fileLabel}] [FAIL] Replace failed: {ex.Message}", job);
                                 _failedFiles.Enqueue($"[REPLACE] {input} :: {ex.Message}");
                                 Interlocked.Increment(ref fail);
-
                                 await TryDeleteFileAsync(tempOut).ConfigureAwait(false);
                                 SetJob(job, JobStatus.Failed, "Replace failed: " + ex.Message);
                                 return;
@@ -2118,22 +2175,77 @@ public partial class MainWindow
                             try
                             {
                                 System.IO.File.Move(tempOut, finalOut);
+                                actualFinalPath = finalOut; // The destination is the new file
                             }
                             catch (Exception ex)
                             {
-                                Log($"[{fileLabel}] [FAIL] Move failed: {ex.Message}", job); // Added job param
+                                Log($"[{fileLabel}] [FAIL] Move failed: {ex.Message}", job);
                                 _failedFiles.Enqueue($"[MOVE] {input} -> {finalOut} :: {ex.Message}");
                                 Interlocked.Increment(ref fail);
-
                                 await TryDeleteFileAsync(tempOut).ConfigureAwait(false);
                                 SetJob(job, JobStatus.Failed, "Move failed: " + ex.Message);
                                 return;
                             }
                         }
 
+
+                        // ---------------------------------------------------------
+                        // ✅ PROBE OUTPUT (Throttled & Robust Version)
+                        // ---------------------------------------------------------
+                        // ---------------------------------------------------------
+                        // ✅ PROBE OUTPUT (Semaphore Removed for Speed)
+                        // ---------------------------------------------------------
+                        MediaProbeInfo? outInfo = null;
+
+                        // 1. Retry Loop: Try for up to 2.5 seconds
+                        // We do NOT use _probeSem here. We want this to run immediately.
+                        for (int i = 0; i < 10; i++)
+                        {
+                            try
+                            {
+                                await Task.Delay(100 + (i * 50));
+
+                                outInfo = await GetMediaInfoAsync(actualFinalPath);
+                                if (outInfo != null) break;
+                            }
+                            catch { /* ignore and retry */ }
+                        }
+
+                        // 2. Fallback: If FFprobe failed, force a basic FileInfo check.
+                        if (outInfo == null)
+                        {
+                            try
+                            {
+                                var fi = new FileInfo(actualFinalPath);
+                                fi.Refresh();
+
+                                if (fi.Exists)
+                                {
+                                    double d = job.InputInfo?.Duration ?? 0;
+                                    double f = job.InputInfo?.Fps ?? 0;
+
+                                    outInfo = new MediaProbeInfo(d, "", "", f, 0, fi.Length);
+                                    Log($"[WARN] Probe failed (Process Error), used fallback size.", job);
+                                }
+                            }
+                            catch { /* Truly failed */ }
+                        }
+
+                        // 3. Update the UI
+                        if (outInfo != null)
+                        {
+                            await Dispatcher.InvokeAsync(() => job.SetOutputInfo(outInfo));
+                        }
+                        else
+                        {
+                            Log($"[ERROR] Could not retrieve output stats for: {fileLabel}", job);
+                        }
+                        // ---------------------------------------------------------
+
                         Log($"[{fileLabel}] [OK]", job);
                         Interlocked.Increment(ref ok);
                         tempOutForCleanup = null;
+
                         SetJob(job, JobStatus.Ok, "OK");
                     }
                     else
@@ -2337,6 +2449,144 @@ public partial class MainWindow
             Log($"=== Done. OK={okNow}, FAIL={failNow} ===");
         }
     }
+
+    private async Task<bool> ValidateFfmpegArgsAsync(string ffmpegExe, string argsTemplate)
+    {
+        // Offload to a background thread so we don't block the UI for up to 15 seconds
+        return await Task.Run(() =>
+        {
+            string tempDir = Path.GetTempPath();
+            string testInputFile = Path.Combine(tempDir, $"ffmpeg_test_input_{Guid.NewGuid():N}.mp4");
+            string testOutputFile = Path.Combine(tempDir, $"ffmpeg_test_output_{Guid.NewGuid():N}.mp4");
+
+            try
+            {
+                // Step 1: Create a tiny test input file using lavfi
+                Log("[VALIDATION] Creating test input file...");
+
+                // '-y' so we don't get stuck on overwrite prompts
+                string genArgs = "-hide_banner -y -f lavfi -i color=c=black:s=320x240:d=0.1 "
+                               + "\"" + testInputFile + "\"";
+
+                var genPsi = new ProcessStartInfo
+                {
+                    FileName = ffmpegExe,
+                    Arguments = genArgs,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardError = true,
+                    RedirectStandardOutput = false  // we don't need stdout here
+                };
+
+                using (var genProc = Process.Start(genPsi))
+                {
+                    if (genProc == null)
+                    {
+                        Log("[VALIDATION] Failed to start ffmpeg for test file creation");
+                        return false;
+                    }
+
+                    bool genCompleted = genProc.WaitForExit(5000);
+                    string genStderr = genProc.StandardError.ReadToEnd();
+
+                    if (!genCompleted)
+                    {
+                        try { genProc.Kill(); } catch { }
+                        Log("[VALIDATION] Test file creation timed out");
+                        return false;
+                    }
+
+                    if (genProc.ExitCode != 0)
+                    {
+                        Log("[VALIDATION] Failed to create test input file (exit code " + genProc.ExitCode + ")");
+                        if (!string.IsNullOrWhiteSpace(genStderr))
+                            Log("[VALIDATION] ffmpeg stderr (create): " + genStderr);
+                        return false;
+                    }
+                }
+
+                if (!File.Exists(testInputFile))
+                {
+                    Log("[VALIDATION] Test input file was not created");
+                    return false;
+                }
+
+                // Step 2: Run user's template against the test file
+                Log("[VALIDATION] Testing user arguments...");
+
+                string inDir = tempDir;
+                string inName = "test";
+                string inExt = Path.GetExtension(testInputFile); // ".mp4"
+
+                string userArgs = argsTemplate
+                    .Replace("{in}", testInputFile, StringComparison.OrdinalIgnoreCase)
+                    .Replace("{out}", testOutputFile, StringComparison.OrdinalIgnoreCase)
+                    .Replace("{dir}", inDir, StringComparison.OrdinalIgnoreCase)
+                    .Replace("{name}", inName, StringComparison.OrdinalIgnoreCase)
+                    .Replace("{ext}", inExt, StringComparison.OrdinalIgnoreCase);
+
+                // Don't auto-add progress flags for validation
+                string finalArgs = EnhanceArgs(userArgs, showWindow: true);
+
+                Log($"[VALIDATION] Running: ffmpeg {finalArgs}");
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = ffmpegExe,
+                    Arguments = finalArgs,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardError = true,
+                    RedirectStandardOutput = false   // avoid deadlock risk
+                };
+
+                using (var p = Process.Start(psi))
+                {
+                    if (p == null)
+                    {
+                        Log("[VALIDATION] Failed to start ffmpeg for template validation");
+                        return false;
+                    }
+
+                    bool completed = p.WaitForExit(15000);
+                    string stderrOutput = p.StandardError.ReadToEnd();
+
+                    if (!completed)
+                    {
+                        try { p.Kill(); } catch { }
+                        Log("[VALIDATION] Template test timed out");
+                        return false;
+                    }
+
+                    if (p.ExitCode != 0)
+                    {
+                        Log("[VALIDATION] ✗ FFmpeg exited with error code: " + p.ExitCode);
+                        if (!string.IsNullOrWhiteSpace(stderrOutput))
+                        {
+                            Log("[VALIDATION] Error output:");
+                            Log(stderrOutput);
+                        }
+                        return false;
+                    }
+
+                    Log("[VALIDATION] ✓ Arguments validated successfully");
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[VALIDATION] Exception: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                // Clean up test files
+                try { if (File.Exists(testInputFile)) File.Delete(testInputFile); } catch { }
+                try { if (File.Exists(testOutputFile)) File.Delete(testOutputFile); } catch { }
+            }
+        });
+    }
+
 
     private static bool ContainsToken(string s, string token)
         => s.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
@@ -2655,18 +2905,17 @@ public partial class MainWindow
 
         return win.ShowDialog() == true ? result : null;
     }
-    private double? GetDurationSeconds(string path)
+    private async Task<MediaProbeInfo?> GetMediaInfoAsync(string path)
     {
         string ffprobe = Path.Combine(_appDir, "ffprobe.exe");
-        if (!File.Exists(ffprobe))
-            return null;
+        if (!File.Exists(ffprobe)) return null;
 
         var psi = new ProcessStartInfo(ffprobe)
         {
-            Arguments = $"-v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{path}\"",
+            Arguments = $"-v quiet -print_format json -show_format -show_streams -select_streams v:0 \"{path}\"",
             UseShellExecute = false,
             RedirectStandardOutput = true,
-            RedirectStandardError = true, // keep redirected so it can't block if ffprobe writes errors
+            RedirectStandardError = true, // We redirect this...
             CreateNoWindow = true,
             StandardOutputEncoding = Encoding.UTF8
         };
@@ -2676,27 +2925,75 @@ public partial class MainWindow
             using var p = Process.Start(psi);
             if (p == null) return null;
 
-            string output = p.StandardOutput.ReadToEnd().Trim();
+            // ...So we MUST read it to prevent deadlocks!
+            var stdoutTask = p.StandardOutput.ReadToEndAsync();
+            var stderrTask = p.StandardError.ReadToEndAsync();
 
-            // Drain stderr too so we can't deadlock on a full error buffer.
-            _ = p.StandardError.ReadToEnd();
-
-            // Timeout; if it doesn't exit, kill it and give up.
-            if (!p.WaitForExit(8000))
+            // Wait for exit with timeout
+            var waitTask = p.WaitForExitAsync();
+            if (await Task.WhenAny(waitTask, Task.Delay(5000)) != waitTask)
             {
-                try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
+                try { p.Kill(); } catch { }
                 return null;
             }
 
-            if (p.ExitCode != 0) return null;
-            if (string.IsNullOrWhiteSpace(output) || output.Equals("N/A", StringComparison.OrdinalIgnoreCase))
-                return null;
+            string json = await stdoutTask;
+            await stderrTask; // Ensure error buffer is drained
 
-            if (double.TryParse(output, System.Globalization.NumberStyles.Any,
-                System.Globalization.CultureInfo.InvariantCulture, out double secs) && secs > 0)
-                return secs;
+            if (string.IsNullOrWhiteSpace(json)) return null;
 
-            return null;
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            // --- Format Section ---
+            double duration = 0;
+            long size = 0;
+            long bitrate = 0;
+
+            if (root.TryGetProperty("format", out var format))
+            {
+                if (format.TryGetProperty("duration", out var durProp) &&
+                    double.TryParse(durProp.GetString(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double d))
+                    duration = d;
+
+                if (format.TryGetProperty("size", out var sizeProp) &&
+                    long.TryParse(sizeProp.GetString(), out long s))
+                    size = s;
+
+                if (format.TryGetProperty("bit_rate", out var brProp) &&
+                    long.TryParse(brProp.GetString(), out long br))
+                    bitrate = br;
+            }
+
+            // --- Stream Section ---
+            string codec = "";
+            string res = "";
+            double fps = 0;
+
+            if (root.TryGetProperty("streams", out var streams) && streams.GetArrayLength() > 0)
+            {
+                var vid = streams[0];
+                if (vid.TryGetProperty("codec_name", out var c)) codec = c.GetString() ?? "";
+
+                int w = 0, h = 0;
+                if (vid.TryGetProperty("width", out var wProp)) w = wProp.GetInt32();
+                if (vid.TryGetProperty("height", out var hProp)) h = hProp.GetInt32();
+                if (w > 0 && h > 0) res = $"{w}x{h}";
+
+                if (vid.TryGetProperty("avg_frame_rate", out var fpsProp))
+                {
+                    string val = fpsProp.GetString() ?? "";
+                    var parts = val.Split('/');
+                    if (parts.Length == 2 &&
+                        double.TryParse(parts[0], out double num) &&
+                        double.TryParse(parts[1], out double den) && den > 0)
+                        fps = num / den;
+                    else if (double.TryParse(val, out double flat))
+                        fps = flat;
+                }
+            }
+
+            return new MediaProbeInfo(duration, codec, res, fps, bitrate, size);
         }
         catch
         {
@@ -2705,7 +3002,7 @@ public partial class MainWindow
     }
     private void StartDurationProbe(FileJob job)
     {
-        // If ffprobe missing, just leave TotalSeconds null (no percent display)
+        // If ffprobe missing, just return
         if (!File.Exists(Path.Combine(_appDir, "ffprobe.exe")))
             return;
 
@@ -2714,23 +3011,23 @@ public partial class MainWindow
             await _probeSem.WaitAsync().ConfigureAwait(false);
             try
             {
-                // Cache prevents re-probing the same file if user re-adds it
-                if (!_durationCache.TryGetValue(job.Path, out var dur))
+                // We removed the simple _durationCache because we now need full metadata.
+                // PROBE INPUT
+                var info = await GetMediaInfoAsync(job.Path);
+                if (info != null)
                 {
-                    dur = GetDurationSeconds(job.Path);
-                    _durationCache[job.Path] = dur;
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        // Job might have been removed while probing
+                        if (!_queueSet.Contains(job.Path)) return;
+
+                        // Set the Duration for the progress bar
+                        job.TotalSeconds = info.Duration;
+
+                        // Set the Metadata for the UI text
+                        job.SetInputInfo(info);
+                    }, DispatcherPriority.Background);
                 }
-
-                // Back to UI thread
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    // Job might have been removed while probing
-                    if (!_queueSet.Contains(job.Path)) return;
-
-                    job.TotalSeconds = dur;
-                    // optional:
-                    // job.LastMessage = dur.HasValue ? $"Duration: {dur.Value:0.0}s" : "Duration: (unknown)";
-                }, DispatcherPriority.Background);
             }
             finally
             {
@@ -2738,7 +3035,6 @@ public partial class MainWindow
             }
         });
     }
-
     private void LogExpander_Expanded(object sender, RoutedEventArgs e)
     {
 
@@ -2921,7 +3217,200 @@ public partial class MainWindow
         };
         win.ShowDialog();
     }
-
 }
+public record MediaProbeInfo(double Duration, string Codec, string Resolution, double Fps, long Bitrate, long SizeBytes);
 
+public class JobStatsFormatter : DependencyObject
+{
+    // Store handlers per TextBlock so we can remove them later
+    private static readonly ConditionalWeakTable<TextBlock, EventHandler<PropertyChangedEventArgs>> _handlers =
+        new();
 
+    public static readonly DependencyProperty FileJobProperty =
+        DependencyProperty.RegisterAttached("FileJob", typeof(object), typeof(JobStatsFormatter),
+            new PropertyMetadata(null, OnFileJobChanged));
+
+    public static object GetFileJob(DependencyObject obj) => obj.GetValue(FileJobProperty);
+    public static void SetFileJob(DependencyObject obj, object value) => obj.SetValue(FileJobProperty, value);
+
+    private static void OnFileJobChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is not TextBlock tb) return;
+
+        var oldJob = e.OldValue as INotifyPropertyChanged;
+        var newJob = e.NewValue as INotifyPropertyChanged;
+
+        // 1. PROPERLY REMOVE the old handler (using the stored reference)
+        if (oldJob != null && _handlers.TryGetValue(tb, out var oldHandler))
+        {
+            PropertyChangedEventManager.RemoveHandler(oldJob, oldHandler, "");
+            _handlers.Remove(tb);
+        }
+
+        // 2. Create and store NEW handler
+        if (newJob != null)
+        {
+            // ✅ Create the handler ONCE and store it
+            EventHandler<PropertyChangedEventArgs> handler = (s, a) => OnJobPropertyChanged(s, a, tb);
+            _handlers.Add(tb, handler);
+
+            // Subscribe using the SAME handler reference
+            PropertyChangedEventManager.AddHandler(newJob, handler, "");
+
+            // Initial draw
+            UpdateText(tb, newJob);
+        }
+        else
+        {
+            tb.Inlines.Clear();
+        }
+    }
+
+    // Event Handler:  Runs whenever a property inside FileJob changes
+    private static void OnJobPropertyChanged(object? sender, PropertyChangedEventArgs e, TextBlock tb)
+    {
+        // ✅ UPDATED: Listen to more properties that affect display
+        if (e.PropertyName == "Status" ||
+            e.PropertyName == "InputInfo" ||
+            e.PropertyName == "OutputInfo" ||
+            e.PropertyName == "TotalSeconds" ||      // Duration probe
+            e.PropertyName == "ProcessedSeconds" ||  // Progress
+            e.PropertyName == "LastMessage")         // Any status change
+        {
+            // Must run on UI thread
+            if (tb.Dispatcher.CheckAccess())
+                UpdateText(tb, sender);
+            else
+                tb.Dispatcher.BeginInvoke(() => UpdateText(tb, sender), DispatcherPriority.Background);
+        }
+    }
+
+    private static void UpdateText(TextBlock tb, object? jobObj)
+    {
+        tb.Inlines.Clear();
+        if (jobObj is not FfmpegDrop.MainWindow.FileJob fileJob) return;
+
+        if (fileJob.InputInfo == null) return;
+
+        // Only show "Diff View" if Status is OK **AND** we actually have Output Data
+        bool showDiff = (fileJob.Status == FfmpegDrop.MainWindow.JobStatus.Ok && fileJob.OutputInfo != null);
+
+        if (!showDiff)
+        {
+            // --- PENDING / RUNNING / FALLBACK VIEW ---
+            AddRun(tb, fileJob.InputInfo.Codec);
+            AddSeparator(tb);
+            AddRun(tb, fileJob.InputInfo.Resolution);
+            AddSeparator(tb);
+            if (fileJob.InputInfo.Fps > 0) AddRun(tb, $"{fileJob.InputInfo.Fps: 0.##}fps");
+            AddSeparator(tb);
+            // Show Input Bitrate here
+            if (fileJob.InputInfo.Bitrate > 0) AddRun(tb, FormatBitrate(fileJob.InputInfo.Bitrate));
+            AddSeparator(tb);
+            AddRun(tb, $"{fileJob.InputInfo.SizeBytes / 1024.0 / 1024.0:0.0} MB");
+        }
+        else
+        {
+            // --- DONE VIEW (Comparison) ---
+            var input = fileJob.InputInfo!;
+            var output = fileJob.OutputInfo!;
+
+            // Codec
+            AddDiff(tb, input.Codec, output.Codec);
+            AddSeparator(tb);
+
+            // Resolution
+            AddDiff(tb, input.Resolution, output.Resolution);
+            AddSeparator(tb);
+
+            // FPS
+            if (Math.Abs(input.Fps - output.Fps) > 0.1)
+                AddDiff(tb, $"{input.Fps:0.##}fps", $"{output.Fps:0.##}fps");
+            else if (output.Fps > 0)
+                AddRun(tb, $"{output.Fps:0.##}fps", isBold: false);
+
+            AddSeparator(tb);
+
+            // Bitrate (Show arrow if changed by > 5kbps)
+            long inBr = input.Bitrate;
+            long outBr = output.Bitrate;
+            if (inBr > 0 && outBr > 0 && Math.Abs(inBr - outBr) > 5000)
+                AddDiff(tb, FormatBitrate(inBr), FormatBitrate(outBr));
+            else if (outBr > 0)
+                AddRun(tb, FormatBitrate(outBr), isBold: false);
+
+            AddSeparator(tb);
+
+            // Size
+            double inMb = input.SizeBytes / 1024.0 / 1024.0;
+            double outMb = output.SizeBytes / 1024.0 / 1024.0;
+
+            if (inMb > 0)
+            {
+                double pct = ((outMb - inMb) / inMb) * 100.0;
+                string oldTxt = $"{inMb:0.0} MB";
+
+                string pctText = pct > 0
+                    ? $"+{pct:0.0}%"
+                    : $"{pct:0.0}%";
+
+                string newTxt = $"{outMb:0.0} MB ({pctText})";
+
+                AddRun(tb, oldTxt, isBold: false, isDim: true);
+                AddArrow(tb);
+                AddRun(tb, newTxt, isBold: true, isDim: false);
+            }
+            else
+            {
+                AddRun(tb, $"{outMb:0.0} MB", isBold: true);
+            }
+        }
+    }
+
+    // --- Helpers (Same as before) ---
+
+    private static void AddDiff(TextBlock tb, string oldVal, string newVal)
+    {
+        if (string.IsNullOrEmpty(newVal)) return;
+
+        if (!string.Equals(oldVal, newVal, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(oldVal))
+        {
+            AddRun(tb, oldVal, isBold: false, isDim: true);
+            AddArrow(tb);
+            AddRun(tb, newVal, isBold: true, isDim: false);
+        }
+        else
+        {
+            AddRun(tb, newVal, isBold: false, isDim: true);
+        }
+    }
+
+    private static void AddRun(TextBlock tb, string text, bool isBold = false, bool isDim = true)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+        var run = new System.Windows.Documents.Run(text);
+
+        if (isBold) run.FontWeight = FontWeights.Bold;
+        if (isDim) run.Foreground = System.Windows.Media.Brushes.Gray;
+        // Note: Non-dim runs inherit the TextBlock color (White/Black)
+
+        tb.Inlines.Add(run);
+    }
+
+    private static void AddArrow(TextBlock tb)
+    {
+        tb.Inlines.Add(new System.Windows.Documents.Run(" → ") { Foreground = System.Windows.Media.Brushes.Gray });
+    }
+
+    private static void AddSeparator(TextBlock tb)
+    {
+        if (tb.Inlines.Count > 0)
+            tb.Inlines.Add(new System.Windows.Documents.Run(" • ") { Foreground = System.Windows.Media.Brushes.DarkGray });
+    }
+
+    private static string FormatBitrate(long bps)
+    {
+        if (bps >= 1_000_000) return $"{bps / 1_000_000.0:0.0} Mb/s";
+        return $"{bps / 1000.0:0} kb/s";
+    }
+}
