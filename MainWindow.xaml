@@ -549,7 +549,6 @@
         </Expander>
 
         <!-- Run strip (Row 3) -->
-        <!-- Run strip (Row 3) -->
         <Grid Grid.Row="3" Margin="0,10,0,10">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
@@ -557,35 +556,52 @@
                 <ColumnDefinition Width="Auto"/>
                 <!-- 1: Pause -->
                 <ColumnDefinition Width="Auto"/>
-                <!-- 2: Cancel -->
+                <!-- 2: Add Files -->
                 <ColumnDefinition Width="Auto"/>
-                <!-- 3: Add Files -->
+                <!-- 3: Remove -->
                 <ColumnDefinition Width="Auto"/>
-                <!-- 4: Remove -->
-                <ColumnDefinition Width="Auto"/>
-                <!-- 5: Clear -->
+                <!-- 4: Clear -->
 
                 <ColumnDefinition Width="18"/>
-                <!-- 6: small gap -->
+                <!-- 5: small gap -->
                 <ColumnDefinition Width="*"/>
-                <!-- 7: Progress -->
+                <!-- 6: Progress -->
             </Grid.ColumnDefinitions>
 
-            <Button Grid.Column="0" x:Name="RunBtn" Content="Run" Width="90" Click="Run_Click"/>
-            <Button Grid.Column="1" x:Name="PauseBtn" Content="Pause" Width="90" Margin="8,0,0,0"
-            IsEnabled="False" Click="Pause_Click"/>
-            <Button Grid.Column="2" x:Name="CancelBtn" Content="Cancel" Width="90" Margin="8,0,0,0"
-            IsEnabled="False" Click="Cancel_Click"/>
+            <Button Grid.Column="0"
+            x:Name="RunBtn"
+            Content="Run"
+            Width="90"
+            Click="Run_Click"/>
 
-            <Button Grid.Column="3" Content="Add Files…" Width="110" Margin="24,0,0,0"
+            <Button Grid.Column="1"
+            x:Name="PauseBtn"
+            Content="Pause"
+            Width="90"
+            Margin="8,0,0,0"
+            IsEnabled="False"
+            Click="Pause_Click"/>
+
+            <Button Grid.Column="2"
+            Content="Add Files…"
+            Width="110"
+            Margin="42,0,0,0"
             Click="AddFiles_Click"/>
-            <Button Grid.Column="4" Content="Remove Selected" Width="129" Margin="8,0,0,0"
+
+            <Button Grid.Column="3"
+            Content="Remove Selected"
+            Width="129"
+            Margin="8,0,0,0"
             Click="RemoveSelected_Click"/>
-            <Button Grid.Column="5" Content="Clear" Width="90" Margin="8,0,0,0"
+
+            <Button Grid.Column="4"
+            Content="Clear"
+            Width="90"
+            Margin="8,0,0,0"
             Click="Clear_Click"/>
 
             <!-- Fixed-width progress with a visible track border -->
-            <Border Grid.Column="8"
+            <Border Grid.Column="6"
             BorderBrush="{DynamicResource {x:Static SystemColors.ActiveBorderBrushKey}}"
             BorderThickness="1"
             CornerRadius="3"

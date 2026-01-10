@@ -1386,10 +1386,28 @@ public partial class MainWindow
     private void Clear_Click(object sender, RoutedEventArgs e)
     {
         if (_isRunning) return;
+
         _queue.Clear();
         _queueSet.Clear();
+
+        // Reset main progress bar
+        Progress.Minimum = 0;
+        Progress.Maximum = 1;
+        Progress.Value = 0;
+
+        // Reset overall progress style (remove green/red state)
+        SetOverallProgressCompleted(false);
+
+        // Reset taskbar progress
+        if (TaskbarInfo != null)
+        {
+            TaskbarInfo.ProgressState = TaskbarItemProgressState.None;
+            TaskbarInfo.ProgressValue = 0;
+        }
+
         Status("Queue cleared.");
     }
+
 
 
     private void RemoveSelected_Click(object sender, RoutedEventArgs e)
@@ -1568,40 +1586,6 @@ public partial class MainWindow
     }
 
     // ---------------- Cancel (kills all running ffmpeg procs) ----------------
-    private void Cancel_Click(object sender, RoutedEventArgs e)
-    {
-        if (!_isRunning) return;
-
-        _wasCancelled = true;
-
-        Status("Cancelling…");
-        _cts?.Cancel();
-
-        List<Process> procs;
-        lock (_procLock) procs = _runningProcs.ToList();
-
-        foreach (var p in procs)
-        {
-            try
-            {
-                if (!p.HasExited)
-                {
-                    Log("[CANCEL] Killing ffmpeg…");
-#if NET8_0_OR_GREATER
-                    p.Kill(entireProcessTree: true);
-#else
-                    p.Kill();
-#endif
-                }
-            }
-            catch (Exception ex)
-            {
-                Log("[CANCEL] Kill failed: " + ex.Message);
-            }
-        }
-
-        CancelBtn.IsEnabled = false; // prevent spam clicks
-    }
 
     private void FitArgsBoxToContent()
     {
@@ -1712,8 +1696,12 @@ public partial class MainWindow
     // ---------------- Run (parallel jobs) ----------------
     private async void Run_Click(object sender, RoutedEventArgs e)
     {
-        if (_isRunning) return;
-
+        if (_isRunning)
+        {
+            _wasCancelled = true;
+            _cts?.Cancel();
+            return;
+        }
         _wasCancelled = false;
         UpdateFfmpegStatus();
         string? ffmpegExe = ResolveFfmpegExeOrNull();
@@ -1800,7 +1788,6 @@ public partial class MainWindow
         // 🔍 VALIDATE FFMPEG ARGS BEFORE STARTING BATCH
         Status("Validating FFmpeg arguments...");
         RunBtn.IsEnabled = false;
-        CancelBtn.IsEnabled = false;
         PauseBtn.IsEnabled = false;
 
         bool valid = await ValidateFfmpegArgsAsync(ffmpegExe, argsTemplate);
@@ -1823,8 +1810,8 @@ public partial class MainWindow
 
         // ---- UI: entering run ----
         _isRunning = true;
-        RunBtn.IsEnabled = false;
-        CancelBtn.IsEnabled = true;
+        RunBtn.Content = "Cancel";
+        RunBtn.IsEnabled = true;
         PauseBtn.IsEnabled = true;
 
         _cts = new CancellationTokenSource();
@@ -2402,47 +2389,41 @@ public partial class MainWindow
             // 7) UI reset
             _ = Dispatcher.BeginInvoke(() =>
             {
-                CancelBtn.IsEnabled = false;
                 PauseBtn.IsEnabled = false;
                 PauseBtn.Content = "Pause";
                 _isPaused = false;
 
+                // Back to idle "Run" state
                 RunBtn.IsEnabled = true;
+                RunBtn.Content = "Run";
                 UpdateFfmpegStatus();
 
                 if (_wasCancelled)
                 {
-                    // User explicitly cancelled: don't turn the bar green, just say "Cancelled".
                     Status("Cancelled.");
                     SetOverallProgressCancelled();
                 }
                 else
                 {
-                    // Completed run (even with some FAILs) → mark as done and turn bar green.
                     Status($"Done. OK={okNow}, FAIL={failNow}");
                     SetOverallProgressCompleted(true);
 
-                    // Play a Windows "ding" only on true completion, not on cancel.
                     try
                     {
                         SystemSounds.Asterisk.Play();
                     }
-                    catch
-                    {
-                        // ignore sound errors
-                    }
+                    catch { }
                 }
 
-                // Clear taskbar progress either way.
                 if (TaskbarInfo != null)
                 {
                     TaskbarInfo.ProgressState = TaskbarItemProgressState.None;
                     TaskbarInfo.ProgressValue = 0;
                 }
 
-                // Clear/refresh the hint now that _isRunning is false
                 UpdateJobsLiveHint();
             }, DispatcherPriority.Background);
+
 
             StopFollowingActiveJobs();
 
