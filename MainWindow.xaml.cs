@@ -3079,16 +3079,6 @@ public partial class MainWindow
     }
 
 
-
-
-
-    double InputTP,
-    double InputLRA,
-    double InputThresh,
-    double TargetOffset
-);
-
-
     // ---------------- Tiny WPF prompt (replaces Microsoft.VisualBasic InputBox) ----------------
     private static string? PromptText(Window owner, string label, string title, string defaultValue)
     {
@@ -3427,12 +3417,4 @@ public partial class MainWindow
         win.ShowDialog();
     }
 }
-    string Codec,           // Video codec
-    string Resolution,
-    double Fps,
-    long Bitrate,          // Overall bitrate
-    long SizeBytes,
-    string AudioCodec,     // ✅ Audio codec name
-    long AudioBitrate      // ✅ Audio bitrate
-);
 
