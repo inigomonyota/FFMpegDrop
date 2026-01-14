@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Media;
 using System.Runtime.CompilerServices;
@@ -56,6 +57,7 @@ public partial class MainWindow
     {
         Pending,
         Running,
+        Analyzed,
         Ok,
         Failed,
         Skipped
@@ -306,6 +308,50 @@ public partial class MainWindow
 
     internal sealed class FileJob : INotifyPropertyChanged
     {
+        // ---- Normalization Data (Notifying Properties) ----
+        private LoudnessStats? _loudnessData;
+        public LoudnessStats? LoudnessData
+        {
+            get => _loudnessData;
+            set
+            {
+                if (_loudnessData == value) return;
+                _loudnessData = value;
+                OnPropertyChanged(nameof(LoudnessData));
+                OnPropertyChanged(nameof(HasNormalization));
+                // Force UI refresh - the stats formatter watches this
+                NotifyPropertyChanged(string.Empty);
+            }
+        }
+
+        private double? _targetLufs;
+        public double? TargetLufs
+        {
+            get => _targetLufs;
+            set
+            {
+                // treat null vs non-null as "always different"
+                if (_targetLufs.HasValue && value.HasValue)
+                {
+                    // adjust tolerance as desired (here: 0.001)
+                    if (Math.Abs(_targetLufs.Value - value.Value) < 0.001)
+                        return;
+                }
+                else if (_targetLufs == value) // both null
+                {
+                    return;
+                }
+
+                _targetLufs = value;
+                OnPropertyChanged(nameof(TargetLufs));
+                // Force UI refresh
+                NotifyPropertyChanged(string.Empty);
+            }
+        }
+
+
+        public bool HasNormalization => LoudnessData != null;
+
         public string Path { get; }
 
         private double _smoothedSpeed = 0;
@@ -382,7 +428,18 @@ public partial class MainWindow
             get => _totalSeconds;
             set
             {
-                if (_totalSeconds == value) return;
+                // If both have values, compare with a tolerance
+                if (_totalSeconds.HasValue && value.HasValue)
+                {
+                    // Tolerance: 0.01s (10ms). Adjust if you want it “stickier”.
+                    if (Math.Abs(_totalSeconds.Value - value.Value) < 0.01)
+                        return;
+                }
+                else if (_totalSeconds == value) // both null
+                {
+                    return;
+                }
+
                 _totalSeconds = value;
                 OnPropertyChanged(nameof(TotalSeconds));
                 OnPropertyChanged(nameof(ProgressPercent));
@@ -390,6 +447,7 @@ public partial class MainWindow
                 OnPropertyChanged(nameof(ETAString));
             }
         }
+
 
         // ---------------- Progress (ffmpeg -progress) ----------------
         private double _processedSeconds;
@@ -514,6 +572,11 @@ public partial class MainWindow
 
     private readonly List<Preset> _presets = new();
 
+    private bool _normalizeEnabled;
+    private double _normalizeTargetLufs;    // e.g. -16, -18, etc.
+    private bool _analysisValid;            // true when per-file gains are current
+    private bool IsNormalizationEnabled() => _normalizeEnabled;
+
     private bool _isRunning;
     private bool _initializing;
 
@@ -531,6 +594,8 @@ public partial class MainWindow
     private int _activeRunning = 0;
 
     private CancellationTokenSource? _cts;
+
+    private bool _cliErrorPopupShown = false;
 
     // --- UI log batching (prevents UI freeze with multiple jobs) ---
     private readonly ConcurrentQueue<(FileJob? Job, string Message)> _logQueue = new();
@@ -627,6 +692,8 @@ public partial class MainWindow
 
         _initializing = false;
 
+        UpdateRunButtonContent();
+
         Closing += MainWindow_Closing;
 
         ShowWindowCheck.Checked += (_, _) => SaveSettings();
@@ -706,6 +773,321 @@ public partial class MainWindow
         }
     }
 
+
+    private void NormalizeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_initializing) return;
+
+        if (NormalizeCombo.SelectedItem is ComboBoxItem item &&
+            double.TryParse(item.Tag as string, NumberStyles.Float,
+                            CultureInfo.InvariantCulture, out double target))
+        {
+            _normalizeEnabled = true;
+            _normalizeTargetLufs = target;
+        }
+        else
+        {
+            _normalizeEnabled = false;
+        }
+
+        InvalidateAnalysis();
+        UpdateRunButtonContent();
+
+        // ✅ ADD THIS LINE:
+        if (!_initializing) SaveSettings();
+    }
+
+    private async Task RunBatchAnalysisAsync(string ffmpegExe, List<FileJob> jobsList)
+    {
+        _cts = new CancellationTokenSource();
+        var token = _cts.Token;
+        _isRunning = true;
+
+        // ✅ Get Jobs setting
+        int jobs = (JobsCombo.SelectedItem is int j) ? j : 2;
+        jobs = Math.Clamp(jobs, 1, MaxConcurrentJobs);
+
+        await Dispatcher.InvokeAsync(() =>
+        {
+            RunBtn.IsEnabled = true;
+            RunBtn.Content = "Cancel";
+            PauseBtn.IsEnabled = false;
+
+            Progress.Minimum = 0;
+            Progress.Maximum = jobsList.Count;
+            Progress.Value = 0;
+
+            SetOverallProgressCompleted(false);
+            Status($"Analyzing audio loudness (Jobs={jobs})…");
+
+            if (TaskbarInfo != null)
+            {
+                TaskbarInfo.ProgressState = TaskbarItemProgressState.Normal;
+                TaskbarInfo.ProgressValue = 0;
+            }
+        });
+
+        StartFollowingActiveJobs();
+
+        int done = 0;
+        int measured = 0;
+
+        // ✅ Create channel for FIFO order
+        var ch = Channel.CreateUnbounded<(FileJob Job, int Index)>(new UnboundedChannelOptions
+        {
+            SingleWriter = true,
+            SingleReader = false,
+            AllowSynchronousContinuations = false
+        });
+
+        for (int i = 0; i < jobsList.Count; i++)
+            ch.Writer.TryWrite((jobsList[i], i));
+
+        ch.Writer.Complete();
+
+        // ✅ FIFO start order (like encoding)
+        var startTurn = new TaskCompletionSource<bool>[jobsList.Count + 1];
+        for (int i = 0; i < startTurn.Length; i++)
+            startTurn[i] = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        startTurn[0].TrySetResult(true); // first job may start
+
+        // ✅ Semaphore to limit concurrent analysis
+        using var analysisSem = new SemaphoreSlim(jobs, jobs);
+
+        async Task AnalyzeOneAsync((FileJob Job, int Index) item)
+        {
+            var job = item.Job;
+            int index = item.Index;
+            bool releasedNext = false;
+
+            void ReleaseNextStart()
+            {
+                if (releasedNext) return;
+                releasedNext = true;
+                startTurn[index + 1].TrySetResult(true);
+            }
+
+            try
+            {
+                if (token.IsCancellationRequested)
+                {
+                    ReleaseNextStart();
+                    return;
+                }
+
+                string input = job.Path;
+                string label = System.IO.Path.GetFileName(input);
+
+                if (!File.Exists(input))
+                {
+                    Log($"[ANALYSIS][SKIP] Missing:  {input}", job);
+                    ReleaseNextStart();
+                    return;
+                }
+
+                // ✅ Wait for our turn (FIFO)
+                await startTurn[index].Task.ConfigureAwait(false);
+
+                // ✅ Acquire slot
+                await analysisSem.WaitAsync(token).ConfigureAwait(false);
+
+                try
+                {
+                    // Clear loudness data
+                    job.LoudnessData = null;
+                    job.TargetLufs = null;
+
+                    // Set status to Running
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        job.Status = JobStatus.Running;
+                        job.LastMessage = "Analyzing loudness…";
+                    });
+
+                    // ✅ Release FIFO baton before starting FFmpeg
+                    ReleaseNextStart();
+
+                    var stats = await AnalyzeFileLufsAsync(ffmpegExe, input, job, token);
+
+                    if (stats != null)
+                    {
+                        Interlocked.Increment(ref measured);
+                        job.LoudnessData = stats;
+                        job.TargetLufs = _normalizeTargetLufs;
+
+                        Log($"[ANALYSIS] {label}:  I={stats.InputI:0.0} LUFS, TP={stats.InputTP:0.0} dB, LRA={stats.InputLRA:0.0} LU", job);
+
+                        await Dispatcher.InvokeAsync(() =>
+                        {
+                            job.Status = JobStatus.Analyzed;  // ✅ Changed from Pending
+                            job.LastMessage = $"Analyzed: {stats.InputI:0.0} LUFS";
+                        });
+                    }
+                    else
+                    {
+                        Log($"[ANALYSIS][WARN] Could not measure loudness for {label}", job);
+
+                        await Dispatcher.InvokeAsync(() =>
+                        {
+                            job.Status = JobStatus.Pending;  // ✅ Keep as Pending if failed
+                            job.LastMessage = "Analysis failed";
+                        });
+                    }
+                }
+                finally
+                {
+                    analysisSem.Release();
+                }
+
+                int d = Interlocked.Increment(ref done);
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    Progress.Value = d;
+                    Status($"Analyzing audio loudness… {d}/{jobsList.Count}");
+
+                    if (TaskbarInfo != null && Progress.Maximum > 0)
+                        TaskbarInfo.ProgressValue = Progress.Value / Progress.Maximum;
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                ReleaseNextStart();
+            }
+            catch (Exception ex)
+            {
+                Log($"[ANALYSIS][EXCEPTION] {ex.Message}", job);
+                ReleaseNextStart();
+            }
+        }
+
+        async Task WorkerAsync()
+        {
+            while (await ch.Reader.WaitToReadAsync(token).ConfigureAwait(false))
+            {
+                while (ch.Reader.TryRead(out var item))
+                {
+                    await AnalyzeOneAsync(item).ConfigureAwait(false);
+                }
+            }
+        }
+
+        try
+        {
+            // ✅ Create workers (up to Jobs count)
+            int workerCount = Math.Min(jobs, jobsList.Count);
+            var workers = Enumerable.Range(0, workerCount).Select(_ => WorkerAsync()).ToArray();
+
+            await Task.WhenAll(workers).ConfigureAwait(false);
+
+            if (_wasCancelled || token.IsCancellationRequested)
+            {
+                Status("Analysis cancelled.");
+                SetOverallProgressCancelled();
+                return;
+            }
+
+            int finalMeasured = Volatile.Read(ref measured);
+            if (finalMeasured == 0)
+            {
+                Status("Analysis failed – no loudness data.");
+                SetOverallProgressCancelled();
+                return;
+            }
+
+            _analysisValid = true;
+            Status($"Analysis complete.  Target {_normalizeTargetLufs:0.0} LUFS (two-pass loudnorm ready).");
+            SetOverallProgressCompleted(true);
+        }
+        catch (OperationCanceledException)
+        {
+            Status("Analysis cancelled.");
+            SetOverallProgressCancelled();
+        }
+        finally
+        {
+            _isRunning = false;
+            _cts?.Dispose();
+            _cts = null;
+
+            await Dispatcher.InvokeAsync(() =>
+            {
+                RunBtn.IsEnabled = true;
+                PauseBtn.IsEnabled = false;
+                PauseBtn.Content = "Pause";
+
+                if (TaskbarInfo != null)
+                {
+                    TaskbarInfo.ProgressState = TaskbarItemProgressState.None;
+                    TaskbarInfo.ProgressValue = 0;
+                }
+
+                UpdateRunButtonContent();
+
+                // Scroll back to top when done
+                if (_queue.Count > 0)
+                {
+                    FilesList.UpdateLayout();
+                    FilesList.ScrollIntoView(_queue[0]);
+                }
+
+                // ✅ MOVE THIS INSIDE THE DISPATCHER BLOCK
+                StopFollowingActiveJobs();
+            });
+        }
+    }
+    private void InvalidateAnalysis()
+    {
+        _analysisValid = false;
+
+        foreach (var job in _queue)
+        {
+            job.LoudnessData = null;
+            job.TargetLufs = null;
+        }
+    }
+
+    private void UpdateRunButtonContent()
+    {
+        if (_initializing) return;
+
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.BeginInvoke(UpdateRunButtonContent);
+            return;
+        }
+
+        // ✅ STEP 1: Handle running state (button becomes "Cancel")
+        if (_isRunning)
+        {
+            RunBtn.Content = "Cancel";
+            RunBtn.IsEnabled = true;
+            return;
+        }
+
+        // ✅ STEP 2: Check if FFmpeg is available
+        string? ffmpegExe = ResolveFfmpegExeOrNull();
+        if (ffmpegExe == null)
+        {
+            RunBtn.IsEnabled = false;
+            RunBtn.Content = "Run";
+            return;
+        }
+
+        // ✅ STEP 3: Determine button TEXT based on normalization state
+        //    (Shows user what will happen when they add files)
+        if (IsNormalizationEnabled() && !_analysisValid)
+        {
+            RunBtn.Content = "Analyze Audio";
+        }
+        else
+        {
+            RunBtn.Content = "Run";
+        }
+
+        // ✅ STEP 4: Button is only ENABLED if there are files
+        RunBtn.IsEnabled = (_queue.Count > 0);
+    }
     private void SuppressFollow(TimeSpan forHowLong)
     {
         _suppressFollowUntilUtc = DateTime.UtcNow.Add(forHowLong);
@@ -968,6 +1350,7 @@ public partial class MainWindow
         public string? OutputFolder { get; set; }
         public int Jobs { get; set; } = 2;
         public bool DarkMode { get; set; }
+        public string? NormalizeTarget { get; set; }
     }
 
     private void LoadSettings()
@@ -1008,6 +1391,30 @@ public partial class MainWindow
 
                     // Restore Theme from Settings
                     _isDarkTheme = s.DarkMode;
+                    // Restore Normalization setting
+                    if (!string.IsNullOrWhiteSpace(s.NormalizeTarget) &&
+                        double.TryParse(s.NormalizeTarget, NumberStyles.Float, CultureInfo.InvariantCulture, out double target))
+                    {
+                        _normalizeEnabled = true;
+                        _normalizeTargetLufs = target;
+
+                        // Select the matching ComboBox item
+                        foreach (ComboBoxItem item in NormalizeCombo.Items)
+                        {
+                            if (item.Tag is string tag &&
+                                double.TryParse(tag, NumberStyles.Float, CultureInfo.InvariantCulture, out double itemValue) &&
+                                Math.Abs(itemValue - target) < 0.1)
+                            {
+                                NormalizeCombo.SelectedItem = item;
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        _normalizeEnabled = false;
+                        // "Disabled" is already selected by IsSelected="True" in XAML
+                    }
                 }
             }
             // Case B: No settings file (First Run)
@@ -1019,6 +1426,7 @@ public partial class MainWindow
 
             // Apply the theme (Happens for both Case A and Case B)
             SetTheme(_isDarkTheme);
+            UpdateRunButtonContent();
         }
         catch
         {
@@ -1061,9 +1469,8 @@ public partial class MainWindow
                 OutputFolderEnabled = OutputFolderCheck.IsChecked == true,
                 OutputFolder = OutputFolderBox.Text,
                 Jobs = JobsCombo.SelectedItem is int j ? j : 2,
-
-                // NEW:
-                DarkMode = _isDarkTheme
+                DarkMode = _isDarkTheme,
+                NormalizeTarget = _normalizeEnabled ? _normalizeTargetLufs.ToString(CultureInfo.InvariantCulture) : null  // ✅ ADD THIS
             };
 
             var json = JsonSerializer.Serialize(s, new JsonSerializerOptions { WriteIndented = true });
@@ -1075,7 +1482,7 @@ public partial class MainWindow
         }
     }
     // ---------------- FFmpeg detection (must be next to app exe) ----------------
-    private string? ResolveFfmpegExeOrNull()
+    static private string? ResolveFfmpegExeOrNull()
     {
         string exeDir = AppContext.BaseDirectory;
         string local = Path.Combine(exeDir, "ffmpeg.exe");
@@ -1114,7 +1521,7 @@ public partial class MainWindow
         }
     }
 
-    private string? GetFfmpegVersionString(string exePath)
+    static private string? GetFfmpegVersionString(string exePath)
     {
         try
         {
@@ -1167,7 +1574,15 @@ public partial class MainWindow
     }
 
     // ---------------- UI helpers ----------------
-    private void Status(string msg) => StatusText.Text = msg;
+    private void Status(string msg)
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.BeginInvoke(() => Status(msg));
+            return;
+        }
+        StatusText.Text = msg;
+    }
 
     private void Log(string msg, FileJob? job = null)
     {
@@ -1350,6 +1765,8 @@ public partial class MainWindow
         };
         if (dlg.ShowDialog(this) != true) return;
         AddFiles(dlg.FileNames);
+        InvalidateAnalysis();
+        UpdateRunButtonContent();
     }
 
     private void AddFiles(IEnumerable<string> files)
@@ -1381,6 +1798,7 @@ public partial class MainWindow
         }
 
         Status($"{_queue.Count} file(s) in queue.");
+        UpdateRunButtonContent();
     }
 
     private void Clear_Click(object sender, RoutedEventArgs e)
@@ -1404,6 +1822,8 @@ public partial class MainWindow
             TaskbarInfo.ProgressState = TaskbarItemProgressState.None;
             TaskbarInfo.ProgressValue = 0;
         }
+        InvalidateAnalysis();
+        UpdateRunButtonContent();
 
         Status("Queue cleared.");
     }
@@ -1420,6 +1840,8 @@ public partial class MainWindow
             _queue.Remove(job);
             _queueSet.Remove(job.Path);
         }
+        InvalidateAnalysis();
+        UpdateRunButtonContent();
 
         Status($"{_queue.Count} file(s) in queue.");
     }
@@ -1693,6 +2115,98 @@ public partial class MainWindow
         Progress.Foreground = Brushes.IndianRed;
     }
 
+    /// <summary>
+    /// Analyzes a file using loudnorm filter (pass 1 of two-pass).
+    /// Returns LoudnessStats or null if analysis fails.
+    /// </summary>
+    private async Task<LoudnessStats?> AnalyzeFileLufsAsync(
+        string ffmpegExe,
+        string inputPath,
+        FileJob job,
+        CancellationToken token)
+    {
+        // Use loudnorm with print_format=json for analysis
+        string args = $"-hide_banner -nostdin -i \"{inputPath}\" " +
+                      $"-af loudnorm=I={_normalizeTargetLufs.ToString(CultureInfo.InvariantCulture)}:" +
+                      $"TP=-2.0:LRA=7.0:print_format=json " +
+                      $"-f null -";
+
+        var stderrBuilder = new StringBuilder();
+
+        var result = await RunFfmpegAsync(
+            ffmpegExe,
+            args,
+            showWindow: false,
+            token: token,
+            job: job,
+            onStarted: null,
+            onProgressLine: null,
+            onLogLine: line =>
+            {
+                stderrBuilder.AppendLine(line);
+            });
+
+        if (result.ExitCode != 0)
+            return null;
+
+        // Parse the loudnorm JSON from stderr
+        return ParseLoudnormStats(stderrBuilder.ToString(), job);
+    }
+
+    /// <summary>
+    /// Parses loudnorm JSON output from FFmpeg stderr.
+    /// </summary>
+    private LoudnessStats? ParseLoudnormStats(string stderr, FileJob job)
+    {
+        try
+        {
+            // Find the JSON block (starts with "{" and ends with "}")
+            int jsonStart = stderr.LastIndexOf('{');
+            int jsonEnd = stderr.LastIndexOf('}');
+
+            if (jsonStart == -1 || jsonEnd == -1 || jsonEnd <= jsonStart)
+            {
+                Log("[NORMALIZE] Could not find JSON stats in FFmpeg output", job);
+                return null;
+            }
+
+            string json = stderr.Substring(jsonStart, jsonEnd - jsonStart + 1);
+
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            double inputI = ParseJsonDouble(root, "input_i");
+            double inputTP = ParseJsonDouble(root, "input_tp");
+            double inputLRA = ParseJsonDouble(root, "input_lra");
+            double inputThresh = ParseJsonDouble(root, "input_thresh");
+            double targetOffset = ParseJsonDouble(root, "target_offset");
+
+            Log($"[NORMALIZE] Measured:  I={inputI:F2} LUFS, TP={inputTP:F2} dB, LRA={inputLRA:F2} LU", job);
+
+            return new LoudnessStats(inputI, inputTP, inputLRA, inputThresh, targetOffset);
+        }
+        catch (Exception ex)
+        {
+            Log($"[NORMALIZE] Failed to parse loudnorm JSON: {ex.Message}", job);
+            return null;
+        }
+    }
+
+    private static double ParseJsonDouble(JsonElement root, string propertyName)
+    {
+        if (root.TryGetProperty(propertyName, out var prop))
+        {
+            string? val = prop.GetString();
+            if (double.TryParse(val, NumberStyles.Any,
+                CultureInfo.InvariantCulture, out double result))
+            {
+                return result;
+            }
+        }
+        return 0;
+    }
+
+
     // ---------------- Run (parallel jobs) ----------------
     private async void Run_Click(object sender, RoutedEventArgs e)
     {
@@ -1703,6 +2217,7 @@ public partial class MainWindow
             return;
         }
         _wasCancelled = false;
+        _cliErrorPopupShown = false;
         UpdateFfmpegStatus();
         string? ffmpegExe = ResolveFfmpegExeOrNull();
         if (ffmpegExe == null)
@@ -1719,6 +2234,15 @@ public partial class MainWindow
         if (jobsList.Count == 0)
         {
             Status("Queue is empty.");
+            return;
+        }
+
+        bool normalizationEnabled = IsNormalizationEnabled();
+        bool needAnalysis = normalizationEnabled && !_analysisValid;
+
+        if (needAnalysis)
+        {
+            await RunBatchAnalysisAsync(ffmpegExe, jobsList);
             return;
         }
 
@@ -1784,29 +2308,6 @@ public partial class MainWindow
 
         // Persist current settings (args, jobs, etc.)
         SaveSettings();
-
-        // 🔍 VALIDATE FFMPEG ARGS BEFORE STARTING BATCH
-        Status("Validating FFmpeg arguments...");
-        RunBtn.IsEnabled = false;
-        PauseBtn.IsEnabled = false;
-
-        bool valid = await ValidateFfmpegArgsAsync(ffmpegExe, argsTemplate);
-        if (!valid)
-        {
-            Status("FFmpeg argument validation failed. See log for details.");
-            MessageBox.Show(
-                this,
-                "FFmpeg could not run with the current arguments.\n\n" +
-                "No files were processed.\n\n" +
-                "Check the log window for details, fix the FFmpeg template, then try again.",
-                "FFmpeg Argument Validation Failed",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
-
-
-            RunBtn.IsEnabled = true;
-            return;
-        }
 
         // ---- UI: entering run ----
         _isRunning = true;
@@ -2098,7 +2599,140 @@ public partial class MainWindow
                     tempOutForCleanup = tempOut;
                     runTempFiles.Add(tempOut);
 
-                    string userArgs = argsTemplate
+                    // Start with the template for this job
+                    string templateForJob = argsTemplate;
+
+                    // 🔊 Batch normalization: per-file volume injection, only when safe
+                    // 🔊 TWO-PASS LOUDNORM: Apply measured stats from batch analysis
+                    if (IsNormalizationEnabled() && _analysisValid && job.HasNormalization)
+                    {
+                        var stats = job.LoudnessData!;
+                        double target = job.TargetLufs!.Value;
+
+                        // Build the loudnorm filter with measured values (pass 2)
+                        string normFilter =
+                            $"loudnorm=I={target.ToString(CultureInfo.InvariantCulture)}:" +
+                            $"TP=-2.0:" +
+                            $"LRA=7.0:" +
+                            $"measured_I={stats.InputI.ToString(CultureInfo.InvariantCulture)}:" +
+                            $"measured_TP={stats.InputTP.ToString(CultureInfo.InvariantCulture)}:" +
+                            $"measured_LRA={stats.InputLRA.ToString(CultureInfo.InvariantCulture)}:" +
+                            $"measured_thresh={stats.InputThresh.ToString(CultureInfo.InvariantCulture)}:" +
+                            $"offset={stats.TargetOffset.ToString(CultureInfo.InvariantCulture)}:" +
+                            $"linear=true";
+
+                        // Check if user template already has audio filters
+                        string lower = templateForJob.ToLowerInvariant();
+
+                        bool hasCopyAudio =
+                            lower.Contains("-c:a copy") ||
+                            lower.Contains("-acodec copy");
+
+                        bool hasAudioFilters =
+                            Regex.IsMatch(lower, @"(^|\s)-af(\s|$)") ||
+                            Regex.IsMatch(lower, @"(^|\s)-filter:a(\s|$)") ||
+                            Regex.IsMatch(lower, @"(^|\s)-filter_complex(\s|$)");
+
+                        if (hasAudioFilters)
+                        {
+                            Log("[NORMALIZE] Skipped (custom audio filters present in template)", job);
+                        }
+                        else if (hasCopyAudio)
+                        {
+                            // ✅ SMART REPLACEMENT: User wants normalization, so replace -c:a copy with re-encoding
+
+                            // Determine audio encoder from input codec
+                            string audioEncoder = "aac";  // Safe default
+                            string audioBitrateArg = "-b:a 192k";  // Safe default
+
+                            if (job.InputInfo != null && !string.IsNullOrEmpty(job.InputInfo.AudioCodec))
+                            {
+                                string inCodec = job.InputInfo.AudioCodec.ToLowerInvariant();
+
+                                // Map common codecs
+                                audioEncoder = inCodec switch
+                                {
+                                    "aac" => "aac",
+                                    "mp3" => "libmp3lame",
+                                    "opus" => "libopus",
+                                    "vorbis" => "libvorbis",
+                                    "ac3" => "ac3",
+                                    "eac3" => "eac3",
+                                    "flac" => "flac",
+                                    "alac" => "alac",
+                                    "pcm_s16le" => "pcm_s16le",
+                                    _ => "aac"  // Default fallback
+                                };
+
+                                // Use input bitrate if available
+                                if (job.InputInfo.AudioBitrate > 0)
+                                {
+                                    long kbps = job.InputInfo.AudioBitrate / 1000;
+                                    audioBitrateArg = $"-b:a {kbps}k";
+                                }
+                            }
+
+                            // Replace -c:a copy with smart re-encoding
+                            templateForJob = Regex.Replace(
+                                templateForJob,
+                                @"-c:a\s+copy",   // ✅ Removed the space after the colon
+                                $"-c:a {audioEncoder} {audioBitrateArg}",
+                                RegexOptions.IgnoreCase);
+
+                            templateForJob = Regex.Replace(
+                                templateForJob,
+                                @"-acodec\s+copy",
+                                $"-acodec {audioEncoder} {audioBitrateArg}",
+                                RegexOptions.IgnoreCase);
+
+                            Log($"[NORMALIZE] Replaced '-c:a copy' with '-c:a {audioEncoder} {audioBitrateArg}' for normalization", job);
+
+                            // Now inject the loudnorm filter
+                            const StringComparison cmp = StringComparison.OrdinalIgnoreCase;
+
+                            if (templateForJob.IndexOf("\"{out}\"", cmp) >= 0)
+                            {
+                                templateForJob = templateForJob.Replace(
+                                    "\"{out}\"",
+                                    $"-af {normFilter} \"{{out}}\"",
+                                    cmp);
+                            }
+                            else
+                            {
+                                templateForJob = templateForJob.Replace(
+                                    "{out}",
+                                    $"-af {normFilter} {{out}}",
+                                    cmp);
+                            }
+
+                            Log($"[NORMALIZE] Applying two-pass loudnorm to {fileLabel}", job);
+                        }
+                        else
+                        {
+                            // No conflicts, inject the loudnorm filter normally
+                            const StringComparison cmp = StringComparison.OrdinalIgnoreCase;
+
+                            if (templateForJob.IndexOf("\"{out}\"", cmp) >= 0)
+                            {
+                                templateForJob = templateForJob.Replace(
+                                    "\"{out}\"",
+                                    $"-af {normFilter} \"{{out}}\"",
+                                    cmp);
+                            }
+                            else
+                            {
+                                templateForJob = templateForJob.Replace(
+                                    "{out}",
+                                    $"-af {normFilter} {{out}}",
+                                    cmp);
+                            }
+
+                            Log($"[NORMALIZE] Applying two-pass loudnorm to {fileLabel}", job);
+                        }
+                    }
+
+                    // Now do the usual token replacement
+                    string userArgs = templateForJob
                         .Replace("{in}", input, StringComparison.OrdinalIgnoreCase)
                         .Replace("{out}", tempOut, StringComparison.OrdinalIgnoreCase)
                         .Replace("{dir}", inDir, StringComparison.OrdinalIgnoreCase)
@@ -2176,12 +2810,6 @@ public partial class MainWindow
                         }
 
 
-                        // ---------------------------------------------------------
-                        // ✅ PROBE OUTPUT (Throttled & Robust Version)
-                        // ---------------------------------------------------------
-                        // ---------------------------------------------------------
-                        // ✅ PROBE OUTPUT (Semaphore Removed for Speed)
-                        // ---------------------------------------------------------
                         MediaProbeInfo? outInfo = null;
 
                         // 1. Retry Loop: Try for up to 2.5 seconds
@@ -2211,7 +2839,8 @@ public partial class MainWindow
                                     double d = job.InputInfo?.Duration ?? 0;
                                     double f = job.InputInfo?.Fps ?? 0;
 
-                                    outInfo = new MediaProbeInfo(d, "", "", f, 0, fi.Length);
+                                    // ✅ Updated with audio parameters (empty/zero for fallback)
+                                    outInfo = new MediaProbeInfo(d, "", "", f, 0, fi.Length, "", 0);
                                     Log($"[WARN] Probe failed (Process Error), used fallback size.", job);
                                 }
                             }
@@ -2237,13 +2866,47 @@ public partial class MainWindow
                     }
                     else
                     {
-                        Log($"[{fileLabel}] [FAIL] ExitCode={result.ExitCode}", job); // Added job param
+                        if (result.CliError && !token.IsCancellationRequested)
+                        {
+                            // 🔴 Command line / preset is broken – abort whole batch
+                            Log($"[{fileLabel}] [CLI ERROR] ExitCode={result.ExitCode}", job);
+                            _failedFiles.Enqueue($"[CLI] {input} :: ExitCode={result.ExitCode}");
+                            Interlocked.Increment(ref fail);
+
+                            await TryDeleteFileAsync(tempOut).ConfigureAwait(false);
+                            SetJob(job, JobStatus.Failed, "Command line error (batch aborted)");
+
+                            // Cancel all remaining jobs in this run
+                            try { _cts?.Cancel(); } catch { }
+
+                            if (!_cliErrorPopupShown)
+                            {
+                                _cliErrorPopupShown = true;
+                                _ = Dispatcher.BeginInvoke(new Action(() =>
+                                {
+                                    MessageBox.Show(
+                                        this,
+                                        "FFmpeg reported a command line error while processing this preset.\n\n" +
+                                        "The batch has been aborted to avoid failing every file.\n\n" +
+                                        "Check the log window for the exact FFmpeg error message and fix the preset.",
+                                        "FFmpeg Command Line Error",
+                                        MessageBoxButton.OK,
+                                        MessageBoxImage.Error);
+                                }));
+                            }
+
+                            return;
+                        }
+
+                        // Normal per-file failure (corrupt input, decode error, etc.)
+                        Log($"[{fileLabel}] [FAIL] ExitCode={result.ExitCode}", job);
                         _failedFiles.Enqueue($"[FFMPEG] {input} :: ExitCode={result.ExitCode}");
                         Interlocked.Increment(ref fail);
 
                         await TryDeleteFileAsync(tempOut).ConfigureAwait(false);
                         SetJob(job, JobStatus.Failed, $"ffmpeg ExitCode={result.ExitCode}");
                     }
+
                 }
                 catch (OperationCanceledException)
                 {
@@ -2431,148 +3094,10 @@ public partial class MainWindow
         }
     }
 
-    private async Task<bool> ValidateFfmpegArgsAsync(string ffmpegExe, string argsTemplate)
-    {
-        // Offload to a background thread so we don't block the UI for up to 15 seconds
-        return await Task.Run(() =>
-        {
-            string tempDir = Path.GetTempPath();
-            string testInputFile = Path.Combine(tempDir, $"ffmpeg_test_input_{Guid.NewGuid():N}.mp4");
-            string testOutputFile = Path.Combine(tempDir, $"ffmpeg_test_output_{Guid.NewGuid():N}.mp4");
-
-            try
-            {
-                // Step 1: Create a tiny test input file using lavfi
-                Log("[VALIDATION] Creating test input file...");
-
-                // '-y' so we don't get stuck on overwrite prompts
-                string genArgs = "-hide_banner -y -f lavfi -i color=c=black:s=320x240:d=0.1 "
-                               + "\"" + testInputFile + "\"";
-
-                var genPsi = new ProcessStartInfo
-                {
-                    FileName = ffmpegExe,
-                    Arguments = genArgs,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = false  // we don't need stdout here
-                };
-
-                using (var genProc = Process.Start(genPsi))
-                {
-                    if (genProc == null)
-                    {
-                        Log("[VALIDATION] Failed to start ffmpeg for test file creation");
-                        return false;
-                    }
-
-                    bool genCompleted = genProc.WaitForExit(5000);
-                    string genStderr = genProc.StandardError.ReadToEnd();
-
-                    if (!genCompleted)
-                    {
-                        try { genProc.Kill(); } catch { }
-                        Log("[VALIDATION] Test file creation timed out");
-                        return false;
-                    }
-
-                    if (genProc.ExitCode != 0)
-                    {
-                        Log("[VALIDATION] Failed to create test input file (exit code " + genProc.ExitCode + ")");
-                        if (!string.IsNullOrWhiteSpace(genStderr))
-                            Log("[VALIDATION] ffmpeg stderr (create): " + genStderr);
-                        return false;
-                    }
-                }
-
-                if (!File.Exists(testInputFile))
-                {
-                    Log("[VALIDATION] Test input file was not created");
-                    return false;
-                }
-
-                // Step 2: Run user's template against the test file
-                Log("[VALIDATION] Testing user arguments...");
-
-                string inDir = tempDir;
-                string inName = "test";
-                string inExt = Path.GetExtension(testInputFile); // ".mp4"
-
-                string userArgs = argsTemplate
-                    .Replace("{in}", testInputFile, StringComparison.OrdinalIgnoreCase)
-                    .Replace("{out}", testOutputFile, StringComparison.OrdinalIgnoreCase)
-                    .Replace("{dir}", inDir, StringComparison.OrdinalIgnoreCase)
-                    .Replace("{name}", inName, StringComparison.OrdinalIgnoreCase)
-                    .Replace("{ext}", inExt, StringComparison.OrdinalIgnoreCase);
-
-                // Don't auto-add progress flags for validation
-                string finalArgs = EnhanceArgs(userArgs, showWindow: true);
-
-                Log($"[VALIDATION] Running: ffmpeg {finalArgs}");
-
-                var psi = new ProcessStartInfo
-                {
-                    FileName = ffmpegExe,
-                    Arguments = finalArgs,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = false   // avoid deadlock risk
-                };
-
-                using (var p = Process.Start(psi))
-                {
-                    if (p == null)
-                    {
-                        Log("[VALIDATION] Failed to start ffmpeg for template validation");
-                        return false;
-                    }
-
-                    bool completed = p.WaitForExit(15000);
-                    string stderrOutput = p.StandardError.ReadToEnd();
-
-                    if (!completed)
-                    {
-                        try { p.Kill(); } catch { }
-                        Log("[VALIDATION] Template test timed out");
-                        return false;
-                    }
-
-                    if (p.ExitCode != 0)
-                    {
-                        Log("[VALIDATION] ✗ FFmpeg exited with error code: " + p.ExitCode);
-                        if (!string.IsNullOrWhiteSpace(stderrOutput))
-                        {
-                            Log("[VALIDATION] Error output:");
-                            Log(stderrOutput);
-                        }
-                        return false;
-                    }
-
-                    Log("[VALIDATION] ✓ Arguments validated successfully");
-                    return true;
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"[VALIDATION] Exception: {ex.Message}");
-                return false;
-            }
-            finally
-            {
-                // Clean up test files
-                try { if (File.Exists(testInputFile)) File.Delete(testInputFile); } catch { }
-                try { if (File.Exists(testOutputFile)) File.Delete(testOutputFile); } catch { }
-            }
-        });
-    }
-
-
     private static bool ContainsToken(string s, string token)
         => s.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
 
-    private string EnhanceArgs(string originalArgs, bool showWindow)
+    static private string EnhanceArgs(string originalArgs, bool showWindow)
     {
         var parts = new List<string>();
         var sb = new StringBuilder();
@@ -2613,6 +3138,32 @@ public partial class MainWindow
         return sb.ToString().Trim();
     }
 
+    private static bool LooksLikeCliError(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return false;
+        string s = line.ToLowerInvariant();
+
+        // Things that usually mean the preset / arguments are bad, not the file.
+        if (s.Contains("unrecognized option") ||
+            s.Contains("unknown option") ||
+            s.Contains("option not found") ||
+            s.Contains("invalid argument") ||
+            s.Contains("error parsing options") ||
+            s.Contains("error while parsing option") ||
+            (s.Contains("invalid value") && s.Contains("for option")) ||
+            s.Contains("no such filter") ||
+            s.Contains("unknown filter") ||
+            s.Contains("error opening filters") ||
+            (s.Contains("filtergraph description") && s.Contains("error")) ||
+            s.Contains("unable to find a suitable output format") ||
+            s.Contains("unable to parse option value"))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
     private async Task<ProcResult> RunFfmpegAsync(
     string ffmpegExe,
     string args,
@@ -2623,6 +3174,8 @@ public partial class MainWindow
     Action<string>? onProgressLine = null,   // keep for debug/log if you want
     Action<string>? onLogLine = null)
     {
+        bool cliErrorDetected = false;
+
         ProcessStartInfo psi;
 
         if (showWindow)
@@ -2778,10 +3331,18 @@ public partial class MainWindow
                     Flush(isEnd: false);
                 }, token);
 
-                // stderr log
+                // stderr log + CLI error detection
                 p.ErrorDataReceived += (_, e) =>
                 {
-                    if (e.Data != null) onLogLine?.Invoke(e.Data);
+                    if (e.Data == null) return;
+
+                    string line = e.Data;
+                    onLogLine?.Invoke(line);
+
+                    if (LooksLikeCliError(line))
+                    {
+                        cliErrorDetected = true;
+                    }
                 };
                 p.BeginErrorReadLine();
             }
@@ -2809,11 +3370,11 @@ public partial class MainWindow
                 try { await progressReadTask.ConfigureAwait(false); } catch { }
             }
 
-            return new ProcResult(p.ExitCode);
+            return new ProcResult(p.ExitCode, cliErrorDetected);
         }
         catch (OperationCanceledException)
         {
-            return new ProcResult(-1);
+            return new ProcResult(-1, false);
         }
         finally
         {
@@ -2835,7 +3396,15 @@ public partial class MainWindow
 
 
 
-    private record ProcResult(int ExitCode);
+    private record ProcResult(int ExitCode, bool CliError);
+
+    public record LoudnessStats(
+    double InputI,
+    double InputTP,
+    double InputLRA,
+    double InputThresh,
+    double TargetOffset
+);
 
     public class Preset
     {
@@ -2950,31 +3519,57 @@ public partial class MainWindow
             string codec = "";
             string res = "";
             double fps = 0;
+            string audioCodec = "";
+            long audioBitrate = 0;
 
             if (root.TryGetProperty("streams", out var streams) && streams.GetArrayLength() > 0)
             {
-                var vid = streams[0];
-                if (vid.TryGetProperty("codec_name", out var c)) codec = c.GetString() ?? "";
-
-                int w = 0, h = 0;
-                if (vid.TryGetProperty("width", out var wProp)) w = wProp.GetInt32();
-                if (vid.TryGetProperty("height", out var hProp)) h = hProp.GetInt32();
-                if (w > 0 && h > 0) res = $"{w}x{h}";
-
-                if (vid.TryGetProperty("avg_frame_rate", out var fpsProp))
+                // Parse all streams to find video and audio
+                foreach (var stream in streams.EnumerateArray())
                 {
-                    string val = fpsProp.GetString() ?? "";
-                    var parts = val.Split('/');
-                    if (parts.Length == 2 &&
-                        double.TryParse(parts[0], out double num) &&
-                        double.TryParse(parts[1], out double den) && den > 0)
-                        fps = num / den;
-                    else if (double.TryParse(val, out double flat))
-                        fps = flat;
+                    if (!stream.TryGetProperty("codec_type", out var typeProp))
+                        continue;
+
+                    string codecType = typeProp.GetString() ?? "";
+
+                    if (codecType == "video" && string.IsNullOrEmpty(codec))
+                    {
+                        // Video stream
+                        if (stream.TryGetProperty("codec_name", out var c)) codec = c.GetString() ?? "";
+
+                        int w = 0, h = 0;
+                        if (stream.TryGetProperty("width", out var wProp)) w = wProp.GetInt32();
+                        if (stream.TryGetProperty("height", out var hProp)) h = hProp.GetInt32();
+                        if (w > 0 && h > 0) res = $"{w}x{h}";
+
+                        if (stream.TryGetProperty("avg_frame_rate", out var fpsProp))
+                        {
+                            string val = fpsProp.GetString() ?? "";
+                            var parts = val.Split('/');
+                            if (parts.Length == 2 &&
+                                double.TryParse(parts[0], out double num) &&
+                                double.TryParse(parts[1], out double den) && den > 0)
+                                fps = num / den;
+                            else if (double.TryParse(val, out double flat))
+                                fps = flat;
+                        }
+                    }
+                    else if (codecType == "audio" && string.IsNullOrEmpty(audioCodec))
+                    {
+                        // ✅ Audio stream
+                        if (stream.TryGetProperty("codec_name", out var ac))
+                            audioCodec = ac.GetString() ?? "";
+
+                        if (stream.TryGetProperty("bit_rate", out var abrProp) &&
+                            long.TryParse(abrProp.GetString(), out long abr))
+                        {
+                            audioBitrate = abr;
+                        }
+                    }
                 }
             }
 
-            return new MediaProbeInfo(duration, codec, res, fps, bitrate, size);
+            return new MediaProbeInfo(duration, codec, res, fps, bitrate, size, audioCodec, audioBitrate);
         }
         catch
         {
@@ -3199,7 +3794,16 @@ public partial class MainWindow
         win.ShowDialog();
     }
 }
-public record MediaProbeInfo(double Duration, string Codec, string Resolution, double Fps, long Bitrate, long SizeBytes);
+public record MediaProbeInfo(
+    double Duration,
+    string Codec,           // Video codec
+    string Resolution,
+    double Fps,
+    long Bitrate,          // Overall bitrate
+    long SizeBytes,
+    string AudioCodec,     // ✅ Audio codec name
+    long AudioBitrate      // ✅ Audio bitrate
+);
 
 public class JobStatsFormatter : DependencyObject
 {
@@ -3276,6 +3880,7 @@ public class JobStatsFormatter : DependencyObject
         // Only show "Diff View" if Status is OK **AND** we actually have Output Data
         bool showDiff = (fileJob.Status == FfmpegDrop.MainWindow.JobStatus.Ok && fileJob.OutputInfo != null);
 
+
         if (!showDiff)
         {
             // --- PENDING / RUNNING / FALLBACK VIEW ---
@@ -3283,12 +3888,19 @@ public class JobStatsFormatter : DependencyObject
             AddSeparator(tb);
             AddRun(tb, fileJob.InputInfo.Resolution);
             AddSeparator(tb);
-            if (fileJob.InputInfo.Fps > 0) AddRun(tb, $"{fileJob.InputInfo.Fps: 0.##}fps");
+            if (fileJob.InputInfo.Fps > 0) AddRun(tb, $"{fileJob.InputInfo.Fps:0.##}fps");
             AddSeparator(tb);
             // Show Input Bitrate here
             if (fileJob.InputInfo.Bitrate > 0) AddRun(tb, FormatBitrate(fileJob.InputInfo.Bitrate));
             AddSeparator(tb);
             AddRun(tb, $"{fileJob.InputInfo.SizeBytes / 1024.0 / 1024.0:0.0} MB");
+
+            // 🔊 If we have loudness measured (after analysis), show it at the end
+            if (fileJob.LoudnessData != null)
+            {
+                AddSeparator(tb);
+                AddRun(tb, $"{fileJob.LoudnessData.InputI:0.0} LUFS", isBold: false, isDim: true);
+            }
         }
         else
         {
@@ -3330,12 +3942,7 @@ public class JobStatsFormatter : DependencyObject
             {
                 double pct = ((outMb - inMb) / inMb) * 100.0;
                 string oldTxt = $"{inMb:0.0} MB";
-
-                string pctText = pct > 0
-                    ? $"+{pct:0.0}%"
-                    : $"{pct:0.0}%";
-
-                string newTxt = $"{outMb:0.0} MB ({pctText})";
+                string newTxt = $"{outMb:0.0} MB ({pct:+0.0;-0.0}%)";
 
                 AddRun(tb, oldTxt, isBold: false, isDim: true);
                 AddArrow(tb);
@@ -3344,6 +3951,28 @@ public class JobStatsFormatter : DependencyObject
             else
             {
                 AddRun(tb, $"{outMb:0.0} MB", isBold: true);
+            }
+
+            // 🔊 Loudness summary at the end (if we have LUFS info)
+            if (fileJob.LoudnessData != null)
+            {
+                AddSeparator(tb);
+
+                if (fileJob.TargetLufs.HasValue)
+                {
+                    // Show "measured → target LUFS", similar visual to size diff
+                    string oldTxt = $"{fileJob.LoudnessData.InputI:0.0} LUFS";
+                    string newTxt = $"{fileJob.TargetLufs.Value:0.0} LUFS";
+
+                    AddRun(tb, oldTxt, isBold: false, isDim: true);
+                    AddArrow(tb);
+                    AddRun(tb, newTxt, isBold: true, isDim: false);
+                }
+                else
+                {
+                    // We measured loudness but didn't apply normalization
+                    AddRun(tb, $"{fileJob.LoudnessData.InputI:0.0} LUFS", isBold: false, isDim: true);
+                }
             }
         }
     }
