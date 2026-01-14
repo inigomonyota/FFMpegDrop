@@ -17,6 +17,9 @@ using System.Windows.Media;
 using System.Windows.Shell;
 using System.Windows.Threading;
 using WF = System.Windows.Forms;
+using FfmpegDrop.Models;
+using FfmpegDrop.Services;
+using FfmpegDrop.Helpers;
 
 namespace FfmpegDrop;
 
@@ -52,16 +55,6 @@ public partial class MainWindow
     private volatile bool _enforcePending = false;
 
     private bool _wasCancelled = false;
-
-    internal enum JobStatus
-    {
-        Pending,
-        Running,
-        Analyzed,
-        Ok,
-        Failed,
-        Skipped
-    }
 
     private void UpdateJobsLiveHint()
     {
@@ -304,265 +297,6 @@ public partial class MainWindow
         if (newHeight > 600) newHeight = 600; // Maximum size
 
         LogRowDef.Height = new GridLength(newHeight);
-    }
-
-    internal sealed class FileJob : INotifyPropertyChanged
-    {
-        // ---- Normalization Data (Notifying Properties) ----
-        private LoudnessStats? _loudnessData;
-        public LoudnessStats? LoudnessData
-        {
-            get => _loudnessData;
-            set
-            {
-                if (_loudnessData == value) return;
-                _loudnessData = value;
-                OnPropertyChanged(nameof(LoudnessData));
-                OnPropertyChanged(nameof(HasNormalization));
-                // Force UI refresh - the stats formatter watches this
-                NotifyPropertyChanged(string.Empty);
-            }
-        }
-
-        private double? _targetLufs;
-        public double? TargetLufs
-        {
-            get => _targetLufs;
-            set
-            {
-                // treat null vs non-null as "always different"
-                if (_targetLufs.HasValue && value.HasValue)
-                {
-                    // adjust tolerance as desired (here: 0.001)
-                    if (Math.Abs(_targetLufs.Value - value.Value) < 0.001)
-                        return;
-                }
-                else if (_targetLufs == value) // both null
-                {
-                    return;
-                }
-
-                _targetLufs = value;
-                OnPropertyChanged(nameof(TargetLufs));
-                // Force UI refresh
-                NotifyPropertyChanged(string.Empty);
-            }
-        }
-
-
-        public bool HasNormalization => LoudnessData != null;
-
-        public string Path { get; }
-
-        private double _smoothedSpeed = 0;
-        private const double SpeedSmoothingFactor = 0.3;  // 0-1; lower = smoother
-
-        // --- Per-job Log Storage ---
-        public StringBuilder LogBuilder { get; } = new();
-        public object LogLock { get; } = new();
-
-        // ---------------- Status / message ----------------
-        private JobStatus _status = JobStatus.Pending;
-        public JobStatus Status
-        {
-            get => _status;
-            set
-            {
-                if (_status == value) return;
-                _status = value;
-                OnPropertyChanged(nameof(Status));
-                // Update stats string because "Ok" status triggers the Input -> Output comparison view
-            }
-        }
-
-        private string _lastMessage = "";
-
-        public string FileName => System.IO.Path.GetFileName(Path);
-        public string DirectoryName => System.IO.Path.GetDirectoryName(Path) ?? "";
-
-        public string LastMessage
-        {
-            get => _lastMessage;
-            set
-            {
-                if (_lastMessage == value) return;
-                _lastMessage = value;
-                OnPropertyChanged(nameof(LastMessage));
-            }
-        }
-
-        // ---------------- Metadata / Stats (NEW) ----------------
-        public MediaProbeInfo? InputInfo { get; private set; }
-        public MediaProbeInfo? OutputInfo { get; private set; }
-
-        // Helper to keep the string short and clean
-        private static string FormatBitrate(long bps)
-        {
-            if (bps >= 1_000_000)
-                return $"{bps / 1_000_000.0:0.0} Mb/s";
-
-            return $"{bps / 1000.0:0} kb/s";
-        }
-        public void SetInputInfo(MediaProbeInfo info)
-        {
-            InputInfo = info;
-            // We notify "Self" so the attached property sees a change on the object
-            OnPropertyChanged(nameof(InputInfo));
-            NotifyPropertyChanged(string.Empty); // Force full refresh for UI binding
-        }
-
-        public void SetOutputInfo(MediaProbeInfo info)
-        {
-            OutputInfo = info;
-            OnPropertyChanged(nameof(OutputInfo));
-            NotifyPropertyChanged(string.Empty);
-        }
-
-
-        // ---------------- Duration (ffprobe) ----------------
-        // IMPORTANT: must be a notifying property (NOT auto-property),
-        // otherwise bindings won't update when you set it later async.
-        private double? _totalSeconds;
-        public double? TotalSeconds
-        {
-            get => _totalSeconds;
-            set
-            {
-                // If both have values, compare with a tolerance
-                if (_totalSeconds.HasValue && value.HasValue)
-                {
-                    // Tolerance: 0.01s (10ms). Adjust if you want it “stickier”.
-                    if (Math.Abs(_totalSeconds.Value - value.Value) < 0.01)
-                        return;
-                }
-                else if (_totalSeconds == value) // both null
-                {
-                    return;
-                }
-
-                _totalSeconds = value;
-                OnPropertyChanged(nameof(TotalSeconds));
-                OnPropertyChanged(nameof(ProgressPercent));
-                OnPropertyChanged(nameof(ProgressText));
-                OnPropertyChanged(nameof(ETAString));
-            }
-        }
-
-
-        // ---------------- Progress (ffmpeg -progress) ----------------
-        private double _processedSeconds;
-        public double ProcessedSeconds
-        {
-            get => _processedSeconds;
-            set
-            {
-                // Always accept the final snap-to-end (or any large move)
-                bool isSnapToEnd = TotalSeconds.HasValue && Math.Abs(value - TotalSeconds.Value) < 0.01;
-
-                if (!isSnapToEnd && Math.Abs(_processedSeconds - value) < 0.5)
-                    return;
-
-                _processedSeconds = value;
-                OnPropertyChanged(nameof(ProcessedSeconds));
-                OnPropertyChanged(nameof(ProgressPercent));
-                OnPropertyChanged(nameof(ProgressText));
-                OnPropertyChanged(nameof(ETAString));
-            }
-        }
-
-        public double ProgressPercent
-        {
-            get
-            {
-                if (!TotalSeconds.HasValue || TotalSeconds.Value <= 0) return 0;
-                var pct = (ProcessedSeconds / TotalSeconds.Value) * 100.0;
-                return Math.Clamp(pct, 0.0, 100.0);
-            }
-        }
-
-        // If you end up removing the % text from the UI, you can also delete this.
-        public string ProgressText => $"{ProgressPercent:0.0}%";
-
-        public string ETAString
-        {
-            get
-            {
-                if (!TotalSeconds.HasValue || TotalSeconds.Value <= 0) return "";
-                if (ProcessedSeconds <= 0) return "";
-
-                if (ProcessedSeconds >= TotalSeconds.Value - 0.01)
-                    return "Done";
-
-                // Use smoothed speed for ETA (less jittery)
-                double remaining = TotalSeconds.Value - ProcessedSeconds;
-
-                if (_smoothedSpeed > 0.01)
-                {
-                    // Estimate time at current smoothed speed
-                    double estimatedSeconds = remaining / _smoothedSpeed;
-                    var ts = TimeSpan.FromSeconds(Math.Max(0, estimatedSeconds));
-                    return ts.TotalHours >= 1 ? ts.ToString(@"h\:mm\:ss") : ts.ToString(@"mm\:ss");
-                }
-
-                // Fallback:  assume linear progress (speed not yet stabilized)
-                var fallback = TimeSpan.FromSeconds(Math.Max(0, remaining));
-                return fallback.TotalHours >= 1 ? fallback.ToString(@"h\:mm\:ss") : fallback.ToString(@"mm\:ss");
-            }
-        }
-
-        // ---------------- Speed ----------------
-        private double _speed;
-        public double Speed
-        {
-            get => _speed;
-            set
-            {
-                if (Math.Abs(_speed - value) < 0.01) return;
-                _speed = value;
-                OnPropertyChanged(nameof(Speed));
-                OnPropertyChanged(nameof(SpeedText));
-                OnPropertyChanged(nameof(ETAString));  // ← Refresh ETA when speed changes
-            }
-        }
-
-        public string SpeedText => Speed > 0 ? $"{Speed:0.00}x" : "";
-
-        /// <summary>
-        /// Updates the smoothed speed using exponential moving average. 
-        /// Call this when a new raw speed value arrives from ffmpeg.
-        /// </summary>
-        public void UpdateSmoothedSpeed(double rawSpeed)
-        {
-            if (rawSpeed > 0.01)
-            {
-                _smoothedSpeed = (_smoothedSpeed * (1 - SpeedSmoothingFactor))
-                               + (rawSpeed * SpeedSmoothingFactor);
-            }
-        }
-
-        public FileJob(string path)
-        {
-            Path = path;
-            LastMessage = "Pending";
-            Status = JobStatus.Pending;
-
-            // optional defaults
-            TotalSeconds = null;      // will be filled async by ffprobe
-            ProcessedSeconds = 0;     // will be updated by ffmpeg progress
-            Speed = 0;
-        }
-
-        // ---------------- INotifyPropertyChanged ----------------
-        public event PropertyChangedEventHandler? PropertyChanged;
-
-        private void OnPropertyChanged(string name) =>
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
-
-        /// <summary>
-        /// Public method to notify property changes from outside the class.
-        /// </summary>
-        public void NotifyPropertyChanged(string propertyName) =>
-            OnPropertyChanged(propertyName);
     }
 
     private readonly string _appDir = AppContext.BaseDirectory;
@@ -1166,12 +900,6 @@ public partial class MainWindow
     // =========================================================
     // WINDOWS 10/11 DARK TITLE BAR MAGIC (P/Invoke)
     // =========================================================
-    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
-    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
-
-    private const int DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19;
-    private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
-
     private static bool UseImmersiveDarkMode(Window window, bool enabled)
     {
         // Don't run in Design Mode
@@ -1184,11 +912,11 @@ public partial class MainWindow
             int useImmersiveDarkMode = enabled ? 1 : 0;
 
             // Attempt to set the DWM attribute (Windows 11 & Windows 10 20H1+)
-            if (DwmSetWindowAttribute(handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref useImmersiveDarkMode, sizeof(int)) == 0)
+            if (NativeMethods.DwmSetWindowAttribute(handle, NativeMethods.DWMWA_USE_IMMERSIVE_DARK_MODE, ref useImmersiveDarkMode, sizeof(int)) == 0)
                 return true;
 
             // Fallback for older Windows 10 versions
-            if (DwmSetWindowAttribute(handle, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref useImmersiveDarkMode, sizeof(int)) == 0)
+            if (NativeMethods.DwmSetWindowAttribute(handle, NativeMethods.DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref useImmersiveDarkMode, sizeof(int)) == 0)
                 return true;
         }
         catch
@@ -1328,30 +1056,9 @@ public partial class MainWindow
     }
 
 
-    private static readonly HashSet<string> AllowedExts = new(StringComparer.OrdinalIgnoreCase)
-{
-    ".mp4", ".mkv", ".mov", ".avi",
-    ".mp3", ".wav", ".flac", ".m4a", ".aac"
-};
-
-    private static bool IsAllowedFile(string path)
-    {
-        var ext = Path.GetExtension(path);
-        return !string.IsNullOrWhiteSpace(ext) && AllowedExts.Contains(ext);
-    }
+    private static bool IsAllowedFile(string path) => FileUtils.IsAllowedFile(path);
 
     // ---------------- Portable settings ----------------
-    private sealed class Settings
-    {
-        public string? SelectedPresetName { get; set; }
-        public bool ShowWindow { get; set; }
-        public bool Overwrite { get; set; }
-        public bool OutputFolderEnabled { get; set; }
-        public string? OutputFolder { get; set; }
-        public int Jobs { get; set; } = 2;
-        public bool DarkMode { get; set; }
-        public string? NormalizeTarget { get; set; }
-    }
 
     private void LoadSettings()
     {
@@ -2384,30 +2091,9 @@ public partial class MainWindow
         }
 
         // Rename it to 'Async' to follow convention
-        static async Task TryDeleteFileAsync(string path)
-        {
-            if (string.IsNullOrWhiteSpace(path)) return;
+        static async Task TryDeleteFileAsync(string path) => await FileUtils.TryDeleteFileAsync(path);
 
-            for (int attempt = 0; attempt < 6; attempt++)
-            {
-                try
-                {
-                    if (!File.Exists(path)) return;
-                    File.SetAttributes(path, FileAttributes.Normal);
-                    File.Delete(path);
-                    return;
-                }
-                // Non-blocking wait
-                catch (IOException) { await Task.Delay(60).ConfigureAwait(false); }
-                catch (UnauthorizedAccessException) { await Task.Delay(60).ConfigureAwait(false); }
-                catch { return; }
-            }
-
-            try { if (File.Exists(path)) File.Delete(path); } catch { }
-        }
-
-        static string NormalizePath(string p) =>
-            System.IO.Path.GetFullPath(p).TrimEnd('\\', '/');
+        static string NormalizePath(string p) => FileUtils.NormalizePath(p);
 
         string ReserveUniqueFinalPath(string preferredFullPath)
         {
@@ -3396,21 +3082,12 @@ public partial class MainWindow
 
 
 
-    private record ProcResult(int ExitCode, bool CliError);
-
-    public record LoudnessStats(
-    double InputI,
     double InputTP,
     double InputLRA,
     double InputThresh,
     double TargetOffset
 );
 
-    public class Preset
-    {
-        public string Name { get; set; } = "";
-        public string ArgsTemplate { get; set; } = "";
-    }
 
     // ---------------- Tiny WPF prompt (replaces Microsoft.VisualBasic InputBox) ----------------
     private static string? PromptText(Window owner, string label, string title, string defaultValue)
@@ -3711,17 +3388,6 @@ public partial class MainWindow
         UpdateTaskbarProgress();
     }
 
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    private static extern IntPtr OpenThread(int dwDesiredAccess, bool bInheritHandle, int dwThreadId);
-
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    private static extern int SuspendThread(IntPtr hThread);
-
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    private static extern int ResumeThread(IntPtr hThread);
-
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    private static extern int CloseHandle(IntPtr hObject);
     private async Task WaitUntilAllowedToStartNewJobAsync(CancellationToken token)
     {
         WaitHandle[] handles = { _throttleChanged, token.WaitHandle };
@@ -3746,45 +3412,12 @@ public partial class MainWindow
         }
     }
 
-    private static void SuspendProcess(Process process)
-    {
-        if (process == null) return;
-        try { if (process.HasExited) return; } catch { return; }
+    private static void SuspendProcess(Process process) =>
+        ProcessThrottler.SuspendProcess(process);
 
-        try
-        {
-            foreach (ProcessThread pT in process.Threads)
-            {
-                IntPtr hThread = OpenThread(0x0002, false, pT.Id);
-                if (hThread == IntPtr.Zero) continue;
-                try { SuspendThread(hThread); }
-                finally { CloseHandle(hThread); }
-            }
-        }
-        catch { /* ignore */ }
-    }
+    private static void ResumeProcess(Process process) =>
+        ProcessThrottler.ResumeProcess(process);
 
-    private static void ResumeProcess(Process process)
-    {
-        if (process == null) return;
-        try { if (process.HasExited) return; } catch { return; }
-
-        try
-        {
-            foreach (ProcessThread pT in process.Threads)
-            {
-                IntPtr hThread = OpenThread(0x0002, false, pT.Id);
-                if (hThread == IntPtr.Zero) continue;
-
-                try
-                {
-                    while (ResumeThread(hThread) > 1) { }
-                }
-                finally { CloseHandle(hThread); }
-            }
-        }
-        catch { /* ignore */ }
-    }
     private void About_Click(object sender, RoutedEventArgs e)
     {
         var win = new AboutWindow
@@ -3794,8 +3427,6 @@ public partial class MainWindow
         win.ShowDialog();
     }
 }
-public record MediaProbeInfo(
-    double Duration,
     string Codec,           // Video codec
     string Resolution,
     double Fps,
@@ -3805,222 +3436,3 @@ public record MediaProbeInfo(
     long AudioBitrate      // ✅ Audio bitrate
 );
 
-public class JobStatsFormatter : DependencyObject
-{
-    // Store handlers per TextBlock so we can remove them later
-    private static readonly ConditionalWeakTable<TextBlock, EventHandler<PropertyChangedEventArgs>> _handlers =
-        new();
-
-    public static readonly DependencyProperty FileJobProperty =
-        DependencyProperty.RegisterAttached("FileJob", typeof(object), typeof(JobStatsFormatter),
-            new PropertyMetadata(null, OnFileJobChanged));
-
-    public static object GetFileJob(DependencyObject obj) => obj.GetValue(FileJobProperty);
-    public static void SetFileJob(DependencyObject obj, object value) => obj.SetValue(FileJobProperty, value);
-
-    private static void OnFileJobChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
-    {
-        if (d is not TextBlock tb) return;
-
-        var oldJob = e.OldValue as INotifyPropertyChanged;
-        var newJob = e.NewValue as INotifyPropertyChanged;
-
-        // 1. PROPERLY REMOVE the old handler (using the stored reference)
-        if (oldJob != null && _handlers.TryGetValue(tb, out var oldHandler))
-        {
-            PropertyChangedEventManager.RemoveHandler(oldJob, oldHandler, "");
-            _handlers.Remove(tb);
-        }
-
-        // 2. Create and store NEW handler
-        if (newJob != null)
-        {
-            // ✅ Create the handler ONCE and store it
-            EventHandler<PropertyChangedEventArgs> handler = (s, a) => OnJobPropertyChanged(s, a, tb);
-            _handlers.Add(tb, handler);
-
-            // Subscribe using the SAME handler reference
-            PropertyChangedEventManager.AddHandler(newJob, handler, "");
-
-            // Initial draw
-            UpdateText(tb, newJob);
-        }
-        else
-        {
-            tb.Inlines.Clear();
-        }
-    }
-
-    // Event Handler:  Runs whenever a property inside FileJob changes
-    private static void OnJobPropertyChanged(object? sender, PropertyChangedEventArgs e, TextBlock tb)
-    {
-        // ✅ UPDATED: Listen to more properties that affect display
-        if (e.PropertyName == "Status" ||
-            e.PropertyName == "InputInfo" ||
-            e.PropertyName == "OutputInfo" ||
-            e.PropertyName == "TotalSeconds" ||      // Duration probe
-            e.PropertyName == "ProcessedSeconds" ||  // Progress
-            e.PropertyName == "LastMessage")         // Any status change
-        {
-            // Must run on UI thread
-            if (tb.Dispatcher.CheckAccess())
-                UpdateText(tb, sender);
-            else
-                tb.Dispatcher.BeginInvoke(() => UpdateText(tb, sender), DispatcherPriority.Background);
-        }
-    }
-
-    private static void UpdateText(TextBlock tb, object? jobObj)
-    {
-        tb.Inlines.Clear();
-        if (jobObj is not FfmpegDrop.MainWindow.FileJob fileJob) return;
-
-        if (fileJob.InputInfo == null) return;
-
-        // Only show "Diff View" if Status is OK **AND** we actually have Output Data
-        bool showDiff = (fileJob.Status == FfmpegDrop.MainWindow.JobStatus.Ok && fileJob.OutputInfo != null);
-
-
-        if (!showDiff)
-        {
-            // --- PENDING / RUNNING / FALLBACK VIEW ---
-            AddRun(tb, fileJob.InputInfo.Codec);
-            AddSeparator(tb);
-            AddRun(tb, fileJob.InputInfo.Resolution);
-            AddSeparator(tb);
-            if (fileJob.InputInfo.Fps > 0) AddRun(tb, $"{fileJob.InputInfo.Fps:0.##}fps");
-            AddSeparator(tb);
-            // Show Input Bitrate here
-            if (fileJob.InputInfo.Bitrate > 0) AddRun(tb, FormatBitrate(fileJob.InputInfo.Bitrate));
-            AddSeparator(tb);
-            AddRun(tb, $"{fileJob.InputInfo.SizeBytes / 1024.0 / 1024.0:0.0} MB");
-
-            // 🔊 If we have loudness measured (after analysis), show it at the end
-            if (fileJob.LoudnessData != null)
-            {
-                AddSeparator(tb);
-                AddRun(tb, $"{fileJob.LoudnessData.InputI:0.0} LUFS", isBold: false, isDim: true);
-            }
-        }
-        else
-        {
-            // --- DONE VIEW (Comparison) ---
-            var input = fileJob.InputInfo!;
-            var output = fileJob.OutputInfo!;
-
-            // Codec
-            AddDiff(tb, input.Codec, output.Codec);
-            AddSeparator(tb);
-
-            // Resolution
-            AddDiff(tb, input.Resolution, output.Resolution);
-            AddSeparator(tb);
-
-            // FPS
-            if (Math.Abs(input.Fps - output.Fps) > 0.1)
-                AddDiff(tb, $"{input.Fps:0.##}fps", $"{output.Fps:0.##}fps");
-            else if (output.Fps > 0)
-                AddRun(tb, $"{output.Fps:0.##}fps", isBold: false);
-
-            AddSeparator(tb);
-
-            // Bitrate (Show arrow if changed by > 5kbps)
-            long inBr = input.Bitrate;
-            long outBr = output.Bitrate;
-            if (inBr > 0 && outBr > 0 && Math.Abs(inBr - outBr) > 5000)
-                AddDiff(tb, FormatBitrate(inBr), FormatBitrate(outBr));
-            else if (outBr > 0)
-                AddRun(tb, FormatBitrate(outBr), isBold: false);
-
-            AddSeparator(tb);
-
-            // Size
-            double inMb = input.SizeBytes / 1024.0 / 1024.0;
-            double outMb = output.SizeBytes / 1024.0 / 1024.0;
-
-            if (inMb > 0)
-            {
-                double pct = ((outMb - inMb) / inMb) * 100.0;
-                string oldTxt = $"{inMb:0.0} MB";
-                string newTxt = $"{outMb:0.0} MB ({pct:+0.0;-0.0}%)";
-
-                AddRun(tb, oldTxt, isBold: false, isDim: true);
-                AddArrow(tb);
-                AddRun(tb, newTxt, isBold: true, isDim: false);
-            }
-            else
-            {
-                AddRun(tb, $"{outMb:0.0} MB", isBold: true);
-            }
-
-            // 🔊 Loudness summary at the end (if we have LUFS info)
-            if (fileJob.LoudnessData != null)
-            {
-                AddSeparator(tb);
-
-                if (fileJob.TargetLufs.HasValue)
-                {
-                    // Show "measured → target LUFS", similar visual to size diff
-                    string oldTxt = $"{fileJob.LoudnessData.InputI:0.0} LUFS";
-                    string newTxt = $"{fileJob.TargetLufs.Value:0.0} LUFS";
-
-                    AddRun(tb, oldTxt, isBold: false, isDim: true);
-                    AddArrow(tb);
-                    AddRun(tb, newTxt, isBold: true, isDim: false);
-                }
-                else
-                {
-                    // We measured loudness but didn't apply normalization
-                    AddRun(tb, $"{fileJob.LoudnessData.InputI:0.0} LUFS", isBold: false, isDim: true);
-                }
-            }
-        }
-    }
-
-    // --- Helpers (Same as before) ---
-
-    private static void AddDiff(TextBlock tb, string oldVal, string newVal)
-    {
-        if (string.IsNullOrEmpty(newVal)) return;
-
-        if (!string.Equals(oldVal, newVal, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(oldVal))
-        {
-            AddRun(tb, oldVal, isBold: false, isDim: true);
-            AddArrow(tb);
-            AddRun(tb, newVal, isBold: true, isDim: false);
-        }
-        else
-        {
-            AddRun(tb, newVal, isBold: false, isDim: true);
-        }
-    }
-
-    private static void AddRun(TextBlock tb, string text, bool isBold = false, bool isDim = true)
-    {
-        if (string.IsNullOrEmpty(text)) return;
-        var run = new System.Windows.Documents.Run(text);
-
-        if (isBold) run.FontWeight = FontWeights.Bold;
-        if (isDim) run.Foreground = System.Windows.Media.Brushes.Gray;
-        // Note: Non-dim runs inherit the TextBlock color (White/Black)
-
-        tb.Inlines.Add(run);
-    }
-
-    private static void AddArrow(TextBlock tb)
-    {
-        tb.Inlines.Add(new System.Windows.Documents.Run(" → ") { Foreground = System.Windows.Media.Brushes.Gray });
-    }
-
-    private static void AddSeparator(TextBlock tb)
-    {
-        if (tb.Inlines.Count > 0)
-            tb.Inlines.Add(new System.Windows.Documents.Run(" • ") { Foreground = System.Windows.Media.Brushes.DarkGray });
-    }
-
-    private static string FormatBitrate(long bps)
-    {
-        if (bps >= 1_000_000) return $"{bps / 1_000_000.0:0.0} Mb/s";
-        return $"{bps / 1000.0:0} kb/s";
-    }
-}
